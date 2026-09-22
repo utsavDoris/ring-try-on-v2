@@ -1,5 +1,6 @@
 import { Matrix4, Quaternion, Vector3, MathUtils } from 'three';
 import { MIN_FINGER_EDGE_CONFIDENCE } from './finger-silhouette.ts';
+import { Vector2OneEuroFilter, QuaternionOneEuroFilter, OneEuroFilter } from './one-euro-filter.ts';
 
 export type HandPoint = {
   x: number; y: number; z: number;
@@ -21,8 +22,12 @@ const PALM_ANCHORS = [0, 5, 9, 13, 17];
 const SCALE_BONES = [[0, 5], [0, 9], [0, 13], [0, 17], [5, 17]];
 /** Max stored lateral offset as a fraction of finger width. */
 export const MAX_FIT_OFFSET_RATIO = 0.1;
-/** Refuse / reset size lock when silhouette mid drifts farther than this × width. */
-export const MAX_LOCK_OFFSET_RATIO = 0.12;
+/**
+ * Refuse a new size lock, and drop a locked slot, when the silhouette mid
+ * drifts farther than this × width. Wide enough that a thumb-side bias on
+ * either hand can still lock diameter. Placement stays tighter.
+ */
+export const MAX_LOCK_OFFSET_RATIO = 0.22;
 /** Apply lateral offset in screen placement only when |offset| ≤ this × width. */
 export const PLACEMENT_OFFSET_GATE = 0.08;
 /** Consecutive off-bone edge frames before dropping a locked fit. */
@@ -91,9 +96,73 @@ export function handednessFromPalmWinding(
 }
 
 /**
- * Canonicalize MediaPipe's camera-dependent label. Do not override with 2D
- * palm winding: open left-dorsal hands look "right-shaped" and would flip the
- * ring's head/shank on one hand only.
+ * Calculate 3D anatomical chirality invariant directly from skeletal landmarks.
+ * In a human hand, the scalar triple product ((Index - Wrist) x (Pinky - Wrist)) . (Thumb - Wrist)
+ * is an invariant anatomical property: it is strictly positive for one hand and negative for the other,
+ * and invariant to 3D rotations (pitch, yaw, roll) and distance.
+ */
+export function anatomicalChiralityFromWorld(
+  landmarks: HandPoint[],
+): HandednessLabel | null {
+  if (!landmarks[0] || !landmarks[5] || !landmarks[17]) return null;
+
+  const w = landmarks[0];
+  const i = landmarks[5];
+  const p = landmarks[17];
+
+  const hasWorld = (pt: HandPoint) =>
+    Number.isFinite(pt.worldX) && Number.isFinite(pt.worldY) && Number.isFinite(pt.worldZ);
+
+  if (!hasWorld(w) || !hasWorld(i) || !hasWorld(p)) return null;
+
+  // Search for active thumb landmark with displacement from wrist
+  const thumbIndices = [2, 1, 3, 4];
+  let thumbPt: HandPoint | null = null;
+  for (const idx of thumbIndices) {
+    const pt = landmarks[idx];
+    if (pt && hasWorld(pt)) {
+      const dSq =
+        (pt.worldX! - w.worldX!) ** 2 +
+        (pt.worldY! - w.worldY!) ** 2 +
+        (pt.worldZ! - w.worldZ!) ** 2;
+      if (dSq > 1e-4) {
+        thumbPt = pt;
+        break;
+      }
+    }
+  }
+
+  if (!thumbPt) return null;
+
+  const ux = i.worldX! - w.worldX!;
+  const uy = i.worldY! - w.worldY!;
+  const uz = i.worldZ! - w.worldZ!;
+
+  const vx = p.worldX! - w.worldX!;
+  const vy = p.worldY! - w.worldY!;
+  const vz = p.worldZ! - w.worldZ!;
+
+  const thx = thumbPt.worldX! - w.worldX!;
+  const thy = thumbPt.worldY! - w.worldY!;
+  const thz = thumbPt.worldZ! - w.worldZ!;
+
+  // Cross product: (u x v)
+  const nx = uy * vz - uz * vy;
+  const ny = uz * vx - ux * vz;
+  const nz = ux * vy - uy * vx;
+
+  // Scalar triple product: (u x v) . th
+  const det = nx * thx + ny * thy + nz * thz;
+  if (Math.abs(det) < 1e-7) return null;
+
+  // Right hand: radial thumb makes scalar triple product positive in unmirrored world coordinates.
+  // Left hand: mirror reflection makes scalar triple product negative.
+  return det > 0 ? 'Right' : 'Left';
+}
+
+/**
+ * Canonicalize MediaPipe's camera-dependent label using 3D anatomical chirality
+ * when available, falling back to camera-canonical raw label.
  */
 export class HandednessResolver {
   reset() {}
@@ -101,8 +170,12 @@ export class HandednessResolver {
   resolve(
     raw: string | null | undefined,
     facingMode: 'user' | 'environment',
-    _landmarks?: HandPoint[],
+    landmarks?: HandPoint[],
   ): HandednessLabel | null {
+    if (landmarks) {
+      const chirality = anatomicalChiralityFromWorld(landmarks);
+      if (chirality) return chirality;
+    }
     return anatomicalHandedness(raw, facingMode);
   }
 }
@@ -118,10 +191,11 @@ export function solveRingPose(
   handedness: 'Left' | 'Right' | null,
   mirrored: boolean,
   previousOrientation?: Quaternion,
-  joints: { mcp?: number; pip?: number } = {},
+  joints: { mcp?: number; pip?: number; finger?: string } = {},
 ) {
   const mcp = joints.mcp ?? 13;
   const pip = joints.pip ?? 14;
+  const isThumb = joints.finger === 'thumb' || mcp === 2;
   const required = [0, 5, 9, 13, 17, mcp, pip];
   if (!required.every((i) => landmarks[i] && screen[i])) return null;
   const hasWorld = required.every((i) =>
@@ -143,7 +217,20 @@ export function solveRingPose(
   if (fingerLength < 2 || worldFinger.lengthSq() < 1e-10) return null;
   const index = cameraPoint(5).sub(cameraPoint(0));
   const pinky = cameraPoint(17).sub(cameraPoint(0));
-  const normal = new Vector3().crossVectors(index, pinky);
+  let normal = new Vector3();
+  if (isThumb) {
+    // Thumb dorsal normal:
+    // Thumb bone runs from MCP(2) to IP(3).
+    // Vector from thumb MCP(2) to index MCP(5) spans the palmar web space.
+    const thumbBone = cameraPoint(pip).sub(cameraPoint(mcp));
+    const web = cameraPoint(5).sub(cameraPoint(mcp));
+    normal.crossVectors(web, thumbBone);
+    if (normal.lengthSq() < 1e-10) {
+      normal.crossVectors(index, pinky);
+    }
+  } else {
+    normal.crossVectors(index, pinky);
+  }
   if (normal.lengthSq() < 1e-10) return null;
   normal.normalize();
   // LR1844's stone lies along native -Z. Anatomical Left/Right fixes the sign
@@ -208,10 +295,21 @@ export class RingSurfaceConstraint {
     length: number;
     width: number;
     palmNormalSide: number;
+    handedness?: HandednessLabel | null;
   } | null = null;
   private smoothedFacing = 1;
   reset() { this.reference = null; this.smoothedFacing = 1; }
-  update(orientation: Quaternion, anchors: ScreenPoint[], fingerLength: number, width: number) {
+  update(
+    orientation: Quaternion,
+    anchors: ScreenPoint[],
+    fingerLength: number,
+    width: number,
+    handedness?: HandednessLabel | null,
+  ) {
+    if (this.reference && handedness && this.reference.handedness && this.reference.handedness !== handedness) {
+      // Different hand presented: reset reference so opposite area sign is not treated as palm
+      this.reset();
+    }
     const normal = new Vector3(0, 0, 1).applyQuaternion(orientation);
     const axis = new Vector3(0, 1, 0).applyQuaternion(orientation);
     if (anchors.length < 5 || !(width > 0) || !(fingerLength > 0)) return orientation.clone();
@@ -224,6 +322,7 @@ export class RingSurfaceConstraint {
         length: fingerLength,
         width,
         palmNormalSide: Math.sign(normal.z) || 1,
+        handedness: handedness ?? null,
       };
       this.smoothedFacing = MathUtils.clamp(area / this.reference.area, -1, 1);
     }
@@ -293,18 +392,79 @@ export function fitPalmMotion(before: ScreenPoint[], after: ScreenPoint[]) {
   return { map, scale: Math.hypot(a, b), angle: Math.atan2(b, a), residual };
 }
 
+/** Ignore target flicker smaller than this once display has settled near it. */
+const DISPLAY_WIDTH_DEADBAND = 0.02;
+/** Snap the last fraction so ease-in / catch-up finish cleanly. */
+const DISPLAY_WIDTH_SETTLE = 0.005;
+/** First lock / reacquire: start slightly small then ease up (avoids a hard pop). */
+const DISPLAY_WIDTH_EASE_IN = 0.85;
+
+function smoothDisplayWidth(
+  previousWidth: number,
+  targetWidth: number,
+  dt: number,
+  previousTarget: number,
+): { width: number; target: number } {
+  if (!(targetWidth > 0) || !Number.isFinite(targetWidth)) {
+    return { width: previousWidth, target: previousTarget };
+  }
+  if (!(previousWidth > 0) || !Number.isFinite(previousWidth)) {
+    return {
+      width: targetWidth * DISPLAY_WIDTH_EASE_IN,
+      target: targetWidth,
+    };
+  }
+  const stableTarget = previousTarget > 0 ? previousTarget : targetWidth;
+  const targetFlicker = Math.abs(targetWidth / Math.max(stableTarget, 1e-6) - 1);
+  const displaySettled = Math.abs(previousWidth / Math.max(stableTarget, 1e-6) - 1) < DISPLAY_WIDTH_SETTLE;
+  // Once display has settled on a stable target, ignore tiny target noise.
+  if (displaySettled && targetFlicker < DISPLAY_WIDTH_DEADBAND) {
+    return { width: stableTarget, target: stableTarget };
+  }
+
+  const relative = Math.abs(targetWidth / previousWidth - 1);
+  if (relative < DISPLAY_WIDTH_SETTLE) {
+    return { width: targetWidth, target: targetWidth };
+  }
+  // Small zoom changes ease gently; large camera-distance jumps catch up faster.
+  const hz = relative > 0.08
+    ? 12
+    : MathUtils.lerp(2, 10, MathUtils.clamp((relative - DISPLAY_WIDTH_SETTLE) / 0.06, 0, 1));
+  return {
+    width: MathUtils.lerp(previousWidth, targetWidth, alpha(hz, dt)),
+    target: targetWidth,
+  };
+}
+
 export class RingPoseFilter {
-  private state: { raw: RingPlacement; value: RingPlacement; time: number; angularStep: Vector3; localStep: ScreenPoint } | null = null;
+  private state: {
+    raw: RingPlacement;
+    value: RingPlacement;
+    time: number;
+    angularStep: Vector3;
+    localStep: ScreenPoint;
+    widthTarget: number;
+  } | null = null;
   reset() { this.state = null; }
   current() { return this.state?.value; }
   update(raw: RingPlacement | null, time: number) {
     const previous = this.state;
     if (!raw) {
-      if (!previous || time - previous.time > 55) this.reset();
+      if (!previous || time - previous.time > 400) this.reset();
       return this.state?.value ?? null;
     }
     if (!previous || time - previous.time > 150) {
-      this.state = { raw, value: { ...raw, orientation: raw.orientation.clone() }, time, angularStep: new Vector3(), localStep: { x: 0, y: 0 } };
+      // Seed below target so first lock eases in instead of popping to full size.
+      const seedWidth = Math.max(raw.width, 1e-6) * DISPLAY_WIDTH_EASE_IN;
+      const value = { ...raw, width: seedWidth, orientation: raw.orientation.clone() };
+      this.state = {
+        raw,
+        value,
+        time,
+        angularStep: new Vector3(),
+        localStep: { x: 0, y: 0 },
+        widthTarget: raw.width,
+      };
       return this.state.value;
     }
     const dt = MathUtils.clamp((time - previous.time) / 1000, 0.001, 0.1);
@@ -362,10 +522,23 @@ export class RingPoseFilter {
       const correctionHz = moving ? 18 : MathUtils.lerp(1.2, 3.8, correctionWeight);
       orientation.premultiply(new Quaternion().setFromAxisAngle(new Vector3(0, 0, 1), -correction * correctionWeight * alpha(correctionHz, dt)));
     }
-    // FingerFitFilter owns diameter. Pass width through so pose tracking cannot
-    // lag or pump scale while following XY / orientation.
-    const value = { ...raw, x, y, width: raw.width, orientation, surfaceFacing: Math.abs(new Vector3(0, 0, 1).applyQuaternion(orientation).z) };
-    this.state = { raw, value, time, angularStep, localStep };
+    // FingerFitFilter owns the locked diameter target. Smooth only the display
+    // width so scale eases with pose instead of stepping while XY lags.
+    const smoothed = smoothDisplayWidth(
+      previous.value.width,
+      raw.width,
+      dt,
+      previous.widthTarget,
+    );
+    const value = {
+      ...raw,
+      x,
+      y,
+      width: smoothed.width,
+      orientation,
+      surfaceFacing: Math.abs(new Vector3(0, 0, 1).applyQuaternion(orientation).z),
+    };
+    this.state = { raw, value, time, angularStep, localStep, widthTarget: smoothed.target };
     return value;
   }
 }
@@ -436,15 +609,66 @@ class PalmScaleLock {
   }
 }
 
-/** Post-lock: slowly track edge widths within this relative band. */
-const POST_LOCK_WIDTH_TRACK = 0.08;
-/** Post-lock: allow slower ratio reconfirm out to this band after a distance jump. */
+/** Post-lock: edges within this relative band may update offset / drift; ratio stays frozen. */
 const POST_LOCK_WIDTH_RECONFIRM = 0.2;
 /** Distinct edge revisions must arrive within this many ms to confirm. */
 const CONFIRM_REVISION_GAP_MS = 180;
 const CONFIRM_FRAMES = 3;
+/** After a finger or hand change: fewer frames, and a gap that still chains on a slow camera. */
+const RELOCK_CONFIRM_FRAMES = 2;
+const RELOCK_REVISION_GAP_MS = 480;
+const RELOCK_RATIO_BAND = 0.08;
+const RELOCK_MIN_FACING = 0.65;
+/** Agreeing frames before a Left/Right label change switches slots. */
+const HAND_SLOT_SWAP_FRAMES = 2;
+
+type FitEvidenceStatus = 'waiting' | 'uncertain' | 'side view' | 'confirming' | 'accepted';
+
+type FitSlot = {
+  distance: PalmScaleLock;
+  ratio: number | null;
+  width: number;
+  candidateRatio: number;
+  candidateOffset: number;
+  candidateFrames: number;
+  offset: number;
+  revision: number;
+  candidateRevision: number;
+  driftFrames: number;
+  lastHandScale: number;
+  reacquire: boolean;
+  previewWidth: number;
+  previewOffset: number;
+  evidenceStatus: FitEvidenceStatus;
+};
+
+function blankSlot(reacquire: boolean): FitSlot {
+  return {
+    distance: new PalmScaleLock(),
+    ratio: null,
+    width: 0,
+    candidateRatio: 0,
+    candidateOffset: 0,
+    candidateFrames: 0,
+    offset: 0,
+    revision: -1,
+    candidateRevision: -Infinity,
+    driftFrames: 0,
+    lastHandScale: 0,
+    reacquire,
+    previewWidth: 0,
+    previewOffset: 0,
+    evidenceStatus: 'waiting',
+  };
+}
+
+function slotKey(finger?: string | null, hand?: HandednessLabel | null) {
+  return `${hand ?? ''}:${finger ?? ''}`;
+}
 
 export class FingerFitFilter {
+  private slots = new Map<string, FitSlot>();
+  private activeKey: string | null = null;
   private distance = new PalmScaleLock();
   private ratio: number | null = null;
   private width = 0;
@@ -456,12 +680,31 @@ export class FingerFitFilter {
   private candidateRevision = -Infinity;
   private driftFrames = 0;
   private lastHandScale = 0;
-  private evidenceStatus: 'waiting' | 'uncertain' | 'side view' | 'confirming' | 'accepted' = 'waiting';
+  private reacquire = false;
+  private previewWidth = 0;
+  private previewOffset = 0;
+  private seenFinger: string | null = null;
+  private seenHand: HandednessLabel | null = null;
+  private pendingHand: HandednessLabel | null = null;
+  private handSwapFrames = 0;
+  private evidenceStatus: FitEvidenceStatus = 'waiting';
   get status() { return this.evidenceStatus; }
-  get confirmationFrames() { return Math.min(CONFIRM_FRAMES, this.candidateFrames); }
+  get confirmationFrames() {
+    return Math.min(this.confirmationNeeded, this.candidateFrames);
+  }
+  get confirmationNeeded() {
+    return this.reacquire ? RELOCK_CONFIRM_FRAMES : CONFIRM_FRAMES;
+  }
+  /** True while a finger/hand change is measuring a new diameter. */
+  get relocking() { return this.reacquire && this.ratio === null; }
   get calibrated() { return this.ratio !== null; }
+  /** Anatomical hand that owns the active slot, once a hand has been selected. */
+  get lockedHand() { return this.seenHand; }
+  get lockedFinger() { return this.seenFinger; }
   reset() {
-    this.distance.reset();
+    this.slots.clear();
+    this.activeKey = null;
+    this.distance = new PalmScaleLock();
     this.ratio = null;
     this.width = 0;
     this.candidateRatio = 0;
@@ -472,7 +715,148 @@ export class FingerFitFilter {
     this.candidateRevision = -Infinity;
     this.driftFrames = 0;
     this.lastHandScale = 0;
+    this.reacquire = false;
+    this.previewWidth = 0;
+    this.previewOffset = 0;
+    this.seenFinger = null;
+    this.seenHand = null;
+    this.pendingHand = null;
+    this.handSwapFrames = 0;
     this.evidenceStatus = 'waiting';
+  }
+
+  /**
+   * Drop the active slot's locked diameter and measure it again.
+   * Other hand/finger slots stay cached. A hand-scoped relock also clears
+   * that slot's palm-distance reference.
+   */
+  relock(scope: 'finger' | 'hand') {
+    this.clearCalibration();
+    this.previewWidth = 0;
+    this.previewOffset = 0;
+    this.reacquire = true;
+    this.evidenceStatus = 'waiting';
+    if (scope === 'hand') {
+      this.distance.reset();
+      this.lastHandScale = 0;
+      this.handSwapFrames = 0;
+      this.pendingHand = null;
+    }
+    this.storeActive();
+  }
+
+  /**
+   * Switch to the slot for this hand and finger.
+   * A known lock is restored on this call. A new slot measures on the fast path.
+   */
+  select(finger?: string | null, hand?: HandednessLabel | null) {
+    const nextFinger = finger ?? this.seenFinger;
+    const nextHand = hand ?? this.seenHand;
+    if (!nextFinger && !nextHand) return;
+    const key = slotKey(nextFinger, nextHand);
+    this.seenFinger = nextFinger;
+    this.seenHand = nextHand;
+    this.handSwapFrames = 0;
+    this.pendingHand = null;
+    if (key === this.activeKey) return;
+    this.storeActive();
+    let slot = this.slots.get(key);
+    if (!slot) {
+      slot = blankSlot(true);
+      this.slots.set(key, slot);
+    }
+    this.apply(slot);
+    this.activeKey = key;
+    if (this.ratio !== null) {
+      this.reacquire = false;
+      this.previewWidth = 0;
+      this.previewOffset = 0;
+      this.evidenceStatus = 'accepted';
+    }
+  }
+
+  private capture(): FitSlot {
+    return {
+      distance: this.distance,
+      ratio: this.ratio,
+      width: this.width,
+      candidateRatio: this.candidateRatio,
+      candidateOffset: this.candidateOffset,
+      candidateFrames: this.candidateFrames,
+      offset: this.offset,
+      revision: this.revision,
+      candidateRevision: this.candidateRevision,
+      driftFrames: this.driftFrames,
+      lastHandScale: this.lastHandScale,
+      reacquire: this.reacquire,
+      previewWidth: this.previewWidth,
+      previewOffset: this.previewOffset,
+      evidenceStatus: this.evidenceStatus,
+    };
+  }
+
+  private apply(slot: FitSlot) {
+    this.distance = slot.distance;
+    this.ratio = slot.ratio;
+    this.width = slot.width;
+    this.candidateRatio = slot.candidateRatio;
+    this.candidateOffset = slot.candidateOffset;
+    this.candidateFrames = slot.candidateFrames;
+    this.offset = slot.offset;
+    this.revision = slot.revision;
+    this.candidateRevision = slot.candidateRevision;
+    this.driftFrames = slot.driftFrames;
+    this.lastHandScale = slot.lastHandScale;
+    this.reacquire = slot.reacquire;
+    this.previewWidth = slot.previewWidth;
+    this.previewOffset = slot.previewOffset;
+    this.evidenceStatus = slot.evidenceStatus;
+  }
+
+  private storeActive() {
+    if (!this.activeKey) return;
+    this.slots.set(this.activeKey, this.capture());
+  }
+
+  private observeTarget(finger?: string, hand?: HandednessLabel | null) {
+    if (finger && this.seenFinger && finger !== this.seenFinger) {
+      this.select(finger, hand ?? this.seenHand);
+      return;
+    }
+
+    if (hand && this.seenHand && hand !== this.seenHand) {
+      // One-frame label flicker stays on the current slot. A second agreeing
+      // frame switches slots and keeps the previous hand's lock.
+      if (this.ratio !== null || this.reacquire) {
+        if (this.pendingHand !== hand) {
+          this.pendingHand = hand;
+          this.handSwapFrames = 1;
+        } else {
+          this.handSwapFrames += 1;
+          if (this.handSwapFrames >= HAND_SLOT_SWAP_FRAMES) {
+            this.select(finger ?? this.seenFinger, hand);
+          }
+        }
+      } else {
+        this.select(finger ?? this.seenFinger, hand);
+      }
+      return;
+    }
+
+    if (!this.activeKey && (finger || hand)) {
+      this.select(finger ?? null, hand ?? null);
+      return;
+    }
+
+    if (finger) this.seenFinger = finger;
+    if (hand) {
+      this.seenHand = hand;
+      this.handSwapFrames = 0;
+      this.pendingHand = null;
+    }
+    if ((finger || hand) && this.activeKey !== slotKey(this.seenFinger, this.seenHand)) {
+      this.select(this.seenFinger, this.seenHand);
+    }
   }
 
   private resolveHandScale(
@@ -485,7 +869,8 @@ export class FingerFitFilter {
       this.lastHandScale = handScale;
       return handScale;
     }
-    const canInit = facing >= 0.75
+    const minInitFacing = this.reacquire ? RELOCK_MIN_FACING : 0.75;
+    const canInit = facing >= minInitFacing
       && !!edge
       && edge.confidence >= MIN_FINGER_EDGE_CONFIDENCE;
     const distance = this.distance.update(anchors, handScale, canInit);
@@ -512,6 +897,8 @@ export class FingerFitFilter {
     this.candidateOffset = 0;
     this.candidateRevision = -Infinity;
     this.driftFrames = 0;
+    this.previewWidth = 0;
+    this.previewOffset = 0;
     this.evidenceStatus = 'uncertain';
   }
 
@@ -542,6 +929,9 @@ export class FingerFitFilter {
       this.driftFrames += 1;
       if (this.driftFrames >= FIT_DRIFT_RESET_FRAMES) {
         this.clearCalibration();
+        this.reacquire = true;
+        this.evidenceStatus = 'waiting';
+        this.storeActive();
         return;
       }
     } else if (offsetCentered) {
@@ -549,8 +939,8 @@ export class FingerFitFilter {
     }
 
     // Same front-facing gate for palm or dorsal (|normal.z|). Init with
-    // anchors needs a clearer front; post-lock accepts a slightly lower facing.
-    const minFacing = this.ratio === null && hasAnchors ? 0.75 : 0.65;
+    // anchors needs a clearer front; post-lock and relock accept a slightly lower facing.
+    const minFacing = this.ratio === null && hasAnchors && !this.reacquire ? 0.75 : 0.65;
     if (!widthTrustworthy || !offsetCentered || facing < minFacing) {
       this.candidateFrames = 0;
       this.evidenceStatus = !widthTrustworthy || !offsetCentered ? 'uncertain' : 'side view';
@@ -559,50 +949,45 @@ export class FingerFitFilter {
 
     // Confirm distinct, nearby observations in hand-relative units so
     // approaching the camera does not look like a change of finger shape.
+    const framesNeeded = this.reacquire ? RELOCK_CONFIRM_FRAMES : CONFIRM_FRAMES;
+    const gapMs = this.reacquire ? RELOCK_REVISION_GAP_MS : CONFIRM_REVISION_GAP_MS;
+    const ratioBand = this.reacquire ? RELOCK_RATIO_BAND : 0.05;
     const offsetNorm = clampedOffset / handScale;
     const consistent = edge.revision > this.candidateRevision
-      && edge.revision - this.candidateRevision <= CONFIRM_REVISION_GAP_MS
-      && Math.abs(ratio / Math.max(this.candidateRatio, 1e-6) - 1) < 0.05
-      && Math.abs(offsetNorm - this.candidateOffset) < ratio * 0.15;
+      && edge.revision - this.candidateRevision <= gapMs
+      && Math.abs(ratio / Math.max(this.candidateRatio, 1e-6) - 1) < ratioBand
+      && Math.abs(offsetNorm - this.candidateOffset) < ratio * (this.reacquire ? 0.28 : 0.15);
     this.candidateFrames = consistent ? this.candidateFrames + 1 : 1;
     this.candidateRatio = ratio;
     this.candidateOffset = offsetNorm;
     this.candidateRevision = edge.revision;
-    this.evidenceStatus = this.candidateFrames >= CONFIRM_FRAMES ? 'accepted' : 'confirming';
-    if (this.candidateFrames < CONFIRM_FRAMES) return;
+    this.evidenceStatus = this.candidateFrames >= framesNeeded ? 'accepted' : 'confirming';
+    if (this.reacquire && this.ratio === null) {
+      // Show the new finger's measured span immediately; freeze it once confirmed.
+      this.previewWidth = edge.width;
+      this.previewOffset = clampedOffset;
+    }
+    if (this.candidateFrames < framesNeeded) return;
 
     if (this.ratio === null) {
       // Lock edge-to-edge skin span on the first confirmed clear sequence.
       this.width = edge.width;
       this.offset = offsetNorm;
       this.ratio = this.width / handScale;
+      this.reacquire = false;
+      this.previewWidth = 0;
+      this.previewOffset = 0;
       return;
     }
 
-    // Post-lock: track within ±8%; after a distance jump, slowly reconfirm out to ±20%.
-    const lockedWidth = this.ratio * handScale;
-    const relative = edge.width / Math.max(lockedWidth, 1e-6) - 1;
-    const absRelative = Math.abs(relative);
-    if (absRelative <= POST_LOCK_WIDTH_TRACK) {
-      this.ratio = MathUtils.lerp(
-        this.ratio,
-        edge.width / handScale,
-        alpha(2.2, elapsed),
-      );
-    } else if (absRelative <= POST_LOCK_WIDTH_RECONFIRM) {
-      this.ratio = MathUtils.lerp(
-        this.ratio,
-        edge.width / handScale,
-        alpha(1.4, elapsed),
-      );
-    }
+    // Post-lock: ratio stays frozen (display size still tracks palm distance).
+    // Only recenter laterally on clear, nearby edges.
     const offsetDiff = Math.abs(offsetNorm - this.offset);
-    // Keep the band centered on clear edges without chasing every pixel.
-    if (offsetDiff > 0.006) {
+    if (offsetDiff > 0.018) {
       this.offset = MathUtils.lerp(
         this.offset,
         offsetNorm,
-        alpha(offsetDiff > 0.04 ? 8 : 5.5, elapsed),
+        alpha(offsetDiff > 0.04 ? 5 : 3, elapsed),
       );
     }
   }
@@ -612,7 +997,9 @@ export class FingerFitFilter {
     facing: number,
     edge?: { width: number; offset: number; revision: number; confidence: number },
     anchors?: ScreenPoint[],
+    target?: { finger?: string; hand?: HandednessLabel | null },
   ) {
+    if (target) this.observeTarget(target.finger, target.hand);
     if (!(handScale > 0) || !Number.isFinite(handScale)) return null;
     const resolved = this.resolveHandScale(handScale, facing, edge, anchors);
     if (resolved === null) return null;
@@ -624,7 +1011,12 @@ export class FingerFitFilter {
     // attachment. Only the image-based distance estimate changes display size.
     // Once calibrated, keep returning a size through side and palm turns so
     // the ring can show band profile / rear shank instead of disappearing.
-    if (this.ratio === null) return null;
+    if (this.ratio === null) {
+      if (this.reacquire && this.previewWidth > 0) {
+        return { width: this.previewWidth, offset: this.previewOffset };
+      }
+      return null;
+    }
     this.width = this.ratio * handScale;
     return { width: this.width, offset: this.offset * handScale };
   }

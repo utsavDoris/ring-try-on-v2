@@ -12,11 +12,13 @@ import {
   centerRingOnMetalHole,
   createFingerOccluderGeometry,
   geometrySignature,
+  inferWearStoneAxis,
   measureMetalBounds,
   measureRingInnerDiameter,
   normalizeRingToUnitHole,
   readRingModelExtras,
   resolveFingerWidthPx,
+  resolveRawInnerDiameter,
   ringWorldScale,
 } from '../app/ring-model.ts';
 
@@ -145,6 +147,54 @@ test('centerRingOnMetalHole puts metal AABB center at origin in XYZ', () => {
   metal.material.dispose();
   gem.geometry.dispose();
   gem.material.dispose();
+});
+
+test('inferWearStoneAxis turns a Z-hole +Y-head ring onto the LR1844 wear frame', () => {
+  const root = new Group();
+  for (let i = 0; i < 16; i++) {
+    const angle = (i / 16) * Math.PI * 2;
+    const band = new Mesh(
+      new BoxGeometry(0.22, 0.22, 0.28),
+      new MeshBasicMaterial({ name: 'Metal Band' }),
+    );
+    band.position.set(Math.cos(angle), Math.sin(angle), 0);
+    root.add(band);
+  }
+  const gem = new Mesh(
+    new BoxGeometry(0.35, 0.35, 0.35),
+    new MeshBasicMaterial({ name: 'Diamond Gem' }),
+  );
+  gem.position.set(0, 1.55, 0);
+  root.add(gem);
+  root.updateMatrixWorld(true);
+
+  assert.equal(inferWearStoneAxis(root), '+Y');
+  applyStoneAxisBasis(root, '+Y');
+  root.updateMatrixWorld(true);
+  const world = new Vector3();
+  gem.getWorldPosition(world);
+  assert.ok(world.z < -1, `head should land on -Z, got ${world.toArray()}`);
+  assert.ok(Math.abs(world.y) < 0.35, `head should leave the finger axis, y=${world.y}`);
+
+  root.traverse((object) => {
+    if (object.isMesh) {
+      object.geometry.dispose();
+      object.material.dispose();
+    }
+  });
+});
+
+test('resolveRawInnerDiameter prefers authored extras, then a catalog hint when the hole cannot be measured', () => {
+  const root = new Group();
+  root.add(new Mesh(new BoxGeometry(2, 1, 2), new MeshBasicMaterial({ name: 'Metal Band' })));
+  assert.equal(resolveRawInnerDiameter(root, { authored: 1.91, hint: 9 }), 1.91);
+  assert.equal(resolveRawInnerDiameter(root, { hint: 1.5 }), 1.5);
+  root.traverse((object) => {
+    if (object.isMesh) {
+      object.geometry.dispose();
+      object.material.dispose();
+    }
+  });
 });
 
 test('applyStoneAxisBasis maps +Z extras onto runtime -Z head direction', () => {

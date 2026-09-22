@@ -63,4 +63,39 @@ test('updateDiamondEnvironment dynamically swaps texture on diamond shaders', as
   updated.dispose();
 });
 
+test('createMetalMaterial and applyMetalPreset configure physical jewelry materials with presets', async () => {
+  const { createMetalMaterial, applyMetalPreset } = await import('../app/ring-runtime.ts');
+  const { METAL_OPTIONS } = await import('../app/ring-catalog.ts');
+
+  const yellow = METAL_OPTIONS.find((m) => m.id === 'yellow');
+  const rose = METAL_OPTIONS.find((m) => m.id === 'rose');
+  const white = METAL_OPTIONS.find((m) => m.id === 'white');
+
+  assert.ok(yellow && rose && white);
+
+  const mat = createMetalMaterial(yellow);
+  assert.ok(mat instanceof MeshPhysicalMaterial);
+  assert.equal(mat.color.getHex(), yellow.color);
+  assert.equal(mat.roughness, yellow.roughness);
+  assert.equal(mat.metalness, yellow.metalness);
+  assert.equal(mat.clearcoat, yellow.clearcoat);
+  assert.equal(mat.clearcoatRoughness, yellow.clearcoatRoughness);
+  assert.equal(mat.envMapIntensity, yellow.envMapIntensity);
+  assert.equal(mat.specularIntensity, yellow.specularIntensity);
+  assert.equal(mat.specularColor.getHex(), yellow.specularColor);
+
+  applyMetalPreset(mat, rose);
+  assert.equal(mat.color.getHex(), rose.color);
+  assert.equal(mat.roughness, rose.roughness);
+  assert.equal(mat.metalness, rose.metalness);
+  assert.equal(mat.specularColor.getHex(), rose.specularColor);
+
+  applyMetalPreset(mat, white);
+  assert.equal(mat.color.getHex(), white.color);
+  assert.equal(mat.roughness, white.roughness);
+  assert.equal(mat.clearcoat, white.clearcoat);
+
+  mat.dispose();
+});
+
 

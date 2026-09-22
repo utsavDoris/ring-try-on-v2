@@ -635,6 +635,75 @@ button {
   box-shadow: 0 0 0 2px var(--accent-glow), 0 2px 10px var(--accent-glow);
 }
 
+.metal-pills {
+  display: flex;
+  flex: 1;
+  gap: 8px;
+  flex-wrap: nowrap;
+  min-width: 0;
+}
+
+.metal-pill {
+  flex: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  background: var(--bg-glass);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  color: var(--text-secondary);
+  font-size: 0.75rem;
+  font-weight: 600;
+  padding: 6px 10px;
+  border-radius: var(--radius-full);
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s, border-color 0.15s, box-shadow 0.15s, transform 0.12s;
+  touch-action: manipulation;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.metal-pill:hover {
+  background: var(--bg-glass-strong);
+  color: var(--text-primary);
+  border-color: rgba(255, 255, 255, 0.16);
+}
+
+.metal-pill:active {
+  transform: scale(0.97);
+}
+
+.metal-pill.active {
+  background: var(--bg-glass-strong);
+  color: var(--text-primary);
+  border-color: rgba(255, 255, 255, 0.35);
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.25), 0 2px 8px rgba(0, 0, 0, 0.3);
+}
+
+.metal-pill.active[data-metal="rose"] {
+  border-color: #e0a48c;
+  box-shadow: 0 0 0 1.5px #e0a48c, 0 2px 10px rgba(224, 164, 140, 0.45);
+}
+
+.metal-pill.active[data-metal="yellow"] {
+  border-color: #e4c15a;
+  box-shadow: 0 0 0 1.5px #e4c15a, 0 2px 10px rgba(228, 193, 90, 0.55);
+}
+
+.metal-pill.active[data-metal="white"] {
+  border-color: #f2f0eb;
+  box-shadow: 0 0 0 1.5px #f2f0eb, 0 2px 10px rgba(242, 240, 235, 0.45);
+}
+
+.metal-swatch {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.4), inset 0 1px 1px rgba(255, 255, 255, 0.6);
+  border: 1px solid rgba(0, 0, 0, 0.15);
+}
+
 .seat-slider-end {
   flex: 0 0 auto;
   font-size: 0.68rem;

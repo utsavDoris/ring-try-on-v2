@@ -6,11 +6,8 @@ import * as THREE from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { DRACOLoader } from 'three/addons/loaders/DRACOLoader.js';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
-import {
-  createDiamondBVH,
-  loadDiamondEnvironment,
-} from 'realistic-diamond-shader';
-import { createDiamondMaterial as createProjectDiamondMaterial } from './project-diamond-material.js';
+import { EXRLoader } from 'three/addons/loaders/EXRLoader.js';
+
 import {
   detectionSize, solveRingPose, projectedFingerAxis, RingPoseFilter, FingerFitFilter, RingSurfaceConstraint,
   HandednessResolver,
@@ -18,12 +15,17 @@ import {
   type HandPoint, type RingPlacement as RingModelPlacement,
 } from './ring-tracking';
 import { SkinMotionTracker, type SkinMotion, type FlowCv } from './skin-motion';
+import { Vector2OneEuroFilter } from './one-euro-filter';
 import { findFingerSilhouette, MIN_FINGER_EDGE_CONFIDENCE, sectionMedianWidth, type FingerSilhouette } from './finger-silhouette';
 import {
   ringPixelRatio, limitEnvironmentSize, loadOptionalEnvironment,
   createFallbackDiamondMaterial, createFallbackEnvironment,
   fetchWithProgressAndCache, updateDiamondEnvironment,
+  createMetalMaterial, applyMetalPreset,
 } from './ring-runtime';
+import { DiamondMaterial, flattenGemFacets } from './diamond/DiamondMaterial';
+import { rebuildTemplateGems } from './diamond/fitBrilliantToGem';
+import { createCubeEnvironment, isSharedEnvironmentTexture } from './diamond/environment';
 import {
   DEFAULT_INNER_TO_OUTER_DIAMETER,
   OCCLUSION_LENGTH_RATIO,
@@ -33,11 +35,12 @@ import {
   applyStoneAxisBasis,
   createFingerOccluderGeometry,
   geometrySignature,
+  inferWearStoneAxis,
   isGemMesh,
   isMetalMesh,
-  measureRingInnerDiameter,
   normalizeRingToUnitHole,
   readRingModelExtras,
+  resolveRawInnerDiameter,
   resolveFingerWidthPx,
   ringWorldScale,
 } from './ring-model';
@@ -47,6 +50,9 @@ import {
   getRingFitConfig,
   ringModelUrl,
   type RingSku,
+  type MetalColor,
+  METAL_OPTIONS,
+  DEFAULT_METAL_COLOR,
 } from './ring-catalog';
 import { PatchMotionTracker, usesLightweightTracking } from './patch-motion';
 import { AppIcon, icons } from './ui-icons';
@@ -93,6 +99,7 @@ type FingerEdgePair = Omit<FingerSilhouette, 'width'> & {
 type RingEnvironmentAssets = {
   diamond: THREE.Texture;
   metal: THREE.Texture;
+  diamondCube?: THREE.CubeTexture;
 };
 type OpenCvApi = FlowCv;
 type OpenCvRuntime = OpenCvApi & {
@@ -117,11 +124,28 @@ const errorMessages: Record<string, string> = {
 const HAND_MODEL_INPUT_SIZE = 640;
 // Seat along MCP→PIP (0 = knuckle / palm-ward, 1 = toward tip).
 const SEAT_ALONG_MIN = 0.22;
-const SEAT_ALONG_MAX = 0.58;
-const FINGER_EDGE_CROSS_POSITION = 0.38;
+const SEAT_ALONG_MAX = 0.78;
+const FINGER_EDGE_CROSS_POSITION = 0.60;
 const RING_CAMERA_DISTANCE = 4;
 const RING_WORLD_HEIGHT = 2;
 const DRACO_DECODER_PATH = '/draco/gltf/';
+
+// #region agent log
+function dbgRing(hypothesisId: string, location: string, message: string, data: Record<string, unknown> = {}) {
+  fetch('http://127.0.0.1:7665/ingest/5f61faf5-f1d5-42fb-abf6-a6b3d14d2536', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-Debug-Session-Id': '57cbf5' },
+    body: JSON.stringify({
+      sessionId: '57cbf5',
+      hypothesisId,
+      location,
+      message,
+      data,
+      timestamp: Date.now(),
+    }),
+  }).catch(() => {});
+}
+// #endregion
 
 function resizeRingCamera(camera: THREE.OrthographicCamera, aspect: number) {
   camera.left = -RING_WORLD_HEIGHT * aspect / 2;
@@ -150,7 +174,10 @@ function disposeModelResources(model: THREE.Object3D | null) {
   });
   for (const geometry of geometries) geometry.dispose();
   for (const material of materials) material.dispose();
-  for (const texture of textures) texture.dispose();
+  for (const texture of textures) {
+    if (isSharedEnvironmentTexture(texture)) continue;
+    texture.dispose();
+  }
 }
 
 function placeRingOccluder(
@@ -223,8 +250,11 @@ export default function Home() {
   const ringEnvironmentAssetsRef = useRef<RingEnvironmentAssets | null>(null);
   const ringEnvironmentAssetsPromiseRef =
     useRef<Promise<RingEnvironmentAssets> | null>(null);
-  const ringDiamondMaterialsRef = useRef<THREE.ShaderMaterial[]>([]);
-  const ringDiamondBvhsRef = useRef<Set<{ dispose: () => void }>>(new Set());
+  const diamondCubeEnvRef = useRef<THREE.CubeTexture | null>(null);
+  const ringDiamondMaterialsRef = useRef<THREE.Material[]>([]);
+  const ringMetalMaterialsRef = useRef<THREE.MeshPhysicalMaterial[]>([]);
+  const [metalColor, setMetalColor] = useState<MetalColor>(DEFAULT_METAL_COLOR);
+  const metalColorRef = useRef<MetalColor>(DEFAULT_METAL_COLOR);
   const modelEnabledRef = useRef(true);
   const guidesEnabledRef = useRef(false);
   const ringPoseFilterRef = useRef(new RingPoseFilter());
@@ -243,8 +273,29 @@ export default function Home() {
   const handDetectionCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const sobelFingerEdgesRef = useRef<FingerEdgePair | null>(null);
   const seatCrossPositionRef = useRef(FINGER_EDGE_CROSS_POSITION);
-  const [ringSeatAlong, setRingSeatAlong] = useState(FINGER_EDGE_CROSS_POSITION);
-  const ringSeatAlongRef = useRef(FINGER_EDGE_CROSS_POSITION);
+  const fingerSeatsRef = useRef<Record<TryOnFinger, number>>({
+    thumb: 0.60,
+    index: 0.60,
+    middle: 0.60,
+    ring: 0.60,
+    pinky: 0.60,
+  });
+  const [ringSeatAlong, setRingSeatAlong] = useState(0.60);
+  const ringSeatAlongRef = useRef(0.60);
+  // #region agent log
+  const dbgRingLastRef = useRef({ at: 0, sig: '' });
+  // #endregion
+  const mcpFilterRef = useRef(new Vector2OneEuroFilter(1.0, 0.05));
+  const pipFilterRef = useRef(new Vector2OneEuroFilter(1.0, 0.05));
+  const palmFiltersRef = useRef<Map<number, Vector2OneEuroFilter>>(new Map());
+  const getAnchorFilter = useCallback((index: number) => {
+    let filter = palmFiltersRef.current.get(index);
+    if (!filter) {
+      filter = new Vector2OneEuroFilter(1.2, 0.04);
+      palmFiltersRef.current.set(index, filter);
+    }
+    return filter;
+  }, []);
   const smoothedFingerLandmarksRef = useRef<{ mcp: CameraPoint; pip: CameraPoint; time: number } | null>(null);
   const [targetFinger, setTargetFinger] = useState<TryOnFinger>(DEFAULT_TRY_ON_FINGER);
   const targetFingerRef = useRef<TryOnFinger>(DEFAULT_TRY_ON_FINGER);
@@ -265,7 +316,7 @@ export default function Home() {
     useState<PhotoCaptureMode>('auto');
   const photoCaptureModeRef = useRef<PhotoCaptureMode>('auto');
   const [photoHoldProgress, setPhotoHoldProgress] = useState(0);
-  const [photoHint, setPhotoHint] = useState(DEFAULT_CAPTURE_HINT);
+  const [photoHint, setPhotoHint] = useState<string>(DEFAULT_CAPTURE_HINT);
   const [photoManualReady, setPhotoManualReady] = useState(false);
   const [photoFlash, setPhotoFlash] = useState(false);
   const photoSnapshotRef = useRef<PhotoSnapshot | null>(null);
@@ -298,7 +349,7 @@ export default function Home() {
     progress: 0,
     message: '',
   });
-
+  const [zoomLevel, setZoomLevel] = useState(1);
   const zoomRef = useRef(1);
   const hasHardwareZoomRef = useRef(false);
   const zoomRangeRef = useRef<{ min: number; max: number; step: number }>({ min: 1, max: 3, step: 0.1 });
@@ -308,6 +359,7 @@ export default function Home() {
   const applyZoom = useCallback(async (targetZoom: number) => {
     const clamped = Math.max(1, Math.min(3, Math.round(targetZoom * 10) / 10));
     zoomRef.current = clamped;
+    setZoomLevel(clamped);
     const track = streamRef.current?.getVideoTracks()[0];
     if (track && hasHardwareZoomRef.current) {
       try {
@@ -366,14 +418,14 @@ export default function Home() {
     renderer = new THREE.WebGLRenderer({
       canvas,
       alpha: true,
-      antialias: navigator.maxTouchPoints === 0,
+      antialias: true,
       preserveDrawingBuffer: false,
       powerPreference: 'high-performance',
     });
     renderer.setClearColor(0x000000, 0);
     renderer.outputColorSpace = THREE.SRGBColorSpace;
     renderer.toneMapping = THREE.ACESFilmicToneMapping;
-    renderer.toneMappingExposure = 1;
+    renderer.toneMappingExposure = 1.15;
     renderer.debug.onShaderError = (gl, program, vertex, fragment) => {
       console.error('Ring shader failed.', gl.getProgramInfoLog(program),
         gl.getShaderInfoLog(vertex), gl.getShaderInfoLog(fragment));
@@ -405,12 +457,16 @@ export default function Home() {
     environmentGenerator.dispose();
     ringEnvironmentRef.current = environment;
 
-    scene.add(new THREE.HemisphereLight(0xffffff, 0x4d2d10, 2.5));
-    const keyLight = new THREE.DirectionalLight(0xfff2d5, 4.5);
-    keyLight.position.set(-1, -2, 4);
+    // 4-point studio jewelry light rig balanced for HDR environment maps
+    scene.add(new THREE.AmbientLight(0xffffff, 0.35));
+    const keyLight = new THREE.DirectionalLight(0xfffaed, 1.15);
+    keyLight.position.set(2, 3.5, 4.5);
     scene.add(keyLight);
-    const rimLight = new THREE.DirectionalLight(0xffd38a, 2.4);
-    rimLight.position.set(2, 1, 2);
+    const fillLight = new THREE.DirectionalLight(0xdfeaff, 0.55);
+    fillLight.position.set(-2, -2.5, 3);
+    scene.add(fillLight);
+    const rimLight = new THREE.DirectionalLight(0xffffff, 0.9);
+    rimLight.position.set(0, 4, -2);
     scene.add(rimLight);
 
     const occlusionMaterial = new THREE.MeshBasicMaterial({
@@ -478,9 +534,18 @@ export default function Home() {
   const loadRingEnvironments = useCallback(() => {
     if (!ringEnvironmentAssetsPromiseRef.current) {
       const generation = resourceGenerationRef.current;
+async function loadEXREnvironment(url: string): Promise<THREE.Texture> {
+  const loader = new EXRLoader();
+  return loader.loadAsync(url);
+}
+
       ringEnvironmentAssetsPromiseRef.current = Promise.allSettled([
-        loadOptionalEnvironment(() => loadDiamondEnvironment('/diamond_project.exr', { type: 'exr' })),
-        loadOptionalEnvironment(() => loadDiamondEnvironment('/metal_env.exr', { type: 'exr' })),
+        loadOptionalEnvironment(() =>
+          loadEXREnvironment('/diamond_env.exr').catch(() =>
+            loadEXREnvironment('/diamond_project.exr')
+          )
+        ),
+        loadOptionalEnvironment(() => loadEXREnvironment('/metal_env.exr')),
       ])
         .then(([diamondResult, metalResult]) => {
           if (
@@ -497,8 +562,8 @@ export default function Home() {
           const diamond = diamondResult.value;
           const metal = metalResult.value;
           if (navigator.maxTouchPoints > 0) {
-            limitEnvironmentSize(diamond, 1024);
-            limitEnvironmentSize(metal, 1024);
+            limitEnvironmentSize(diamond, 1536);
+            limitEnvironmentSize(metal, 1536);
           }
           diamond.mapping = THREE.EquirectangularReflectionMapping;
           diamond.wrapS = THREE.RepeatWrapping;
@@ -510,20 +575,64 @@ export default function Home() {
           diamond.generateMipmaps = false;
           diamond.needsUpdate = true;
 
-          const assets = { diamond, metal };
-          ringEnvironmentAssetsRef.current = assets;
+          metal.mapping = THREE.EquirectangularReflectionMapping;
+          metal.colorSpace = THREE.LinearSRGBColorSpace;
+          metal.needsUpdate = true;
 
-          // Upgrade diamond shaders dynamically
-          if (ringDiamondMaterialsRef.current.length > 0) {
-            updateDiamondEnvironment(ringDiamondMaterialsRef.current, diamond);
-            if (fallbackDiamondEnvRef.current) {
-              fallbackDiamondEnvRef.current.dispose();
-              fallbackDiamondEnvRef.current = null;
+          const renderer = ringRendererRef.current;
+          let diamondCube: THREE.CubeTexture | undefined = undefined;
+          if (renderer) {
+            try {
+              const cubeRT = createCubeEnvironment(renderer, diamond, 512);
+              diamondCube = cubeRT.texture as THREE.CubeTexture;
+              diamondCubeEnvRef.current = diamondCube;
+            } catch (err) {
+              console.warn('Cube environment creation failed, using equirect fallback:', err);
             }
           }
 
+          const assets: RingEnvironmentAssets = { diamond, metal, diamondCube };
+          ringEnvironmentAssetsRef.current = assets;
+
+          // Upgrade diamond shaders dynamically
+          if (diamondCube && ringModelRef.current) {
+            const upgradedMats: THREE.Material[] = [];
+            ringModelRef.current.traverse((object) => {
+              if (!(object instanceof THREE.Mesh) || !isGemMesh(object)) return;
+              try {
+                object.geometry = flattenGemFacets(object.geometry);
+                const dMat = new DiamondMaterial({
+                  geometry: object.geometry,
+                  envMap: diamondCube!,
+                });
+                object.material = dMat;
+                object.onBeforeRender = () => {
+                  dMat.updateFromMesh(object);
+                };
+                upgradedMats.push(dMat);
+              } catch (err) {
+                console.warn('Failed to upgrade gem mesh to DiamondMaterial:', err);
+              }
+            });
+            if (upgradedMats.length > 0) {
+              for (const oldMat of ringDiamondMaterialsRef.current) {
+                if (!upgradedMats.includes(oldMat)) oldMat.dispose();
+              }
+              ringDiamondMaterialsRef.current = upgradedMats;
+            }
+          } else if (ringDiamondMaterialsRef.current.length > 0) {
+            updateDiamondEnvironment(
+              ringDiamondMaterialsRef.current,
+              diamondCube ?? diamond,
+            );
+          }
+
+          if (fallbackDiamondEnvRef.current) {
+            fallbackDiamondEnvRef.current.dispose();
+            fallbackDiamondEnvRef.current = null;
+          }
+
           // Upgrade metal environment on the scene
-          const renderer = ringRendererRef.current;
           const scene = ringSceneRef.current;
           const camera = ringCameraRef.current;
           if (renderer && scene) {
@@ -534,15 +643,14 @@ export default function Home() {
 
             const previousEnvironment = ringEnvironmentRef.current;
             scene.environment = metalEnvironment.texture;
+            renderer.toneMappingExposure = 1.1;
             ringEnvironmentRef.current = metalEnvironment;
             previousEnvironment?.dispose();
 
-            for (const material of ringDiamondMaterialsRef.current) {
-              const cameraPosition = material.uniforms.cameraPos?.value;
-              if (cameraPosition instanceof THREE.Vector3 && camera) {
-                cameraPosition.copy(camera.position);
-              }
+            for (const mat of ringMetalMaterialsRef.current) {
+              mat.needsUpdate = true;
             }
+
             if (ringGroupRef.current?.visible && camera) {
               renderer.render(scene, camera);
             }
@@ -609,20 +717,22 @@ export default function Home() {
           model.add(gltf.scene);
           model.updateMatrixWorld(true);
 
+          const extras = readRingModelExtras(gltf.scene);
+          // LR1844 already stores stoneAxis −Z. Other GLBs are authored with the
+          // hole along Z and the head on +Y; bake that onto the wear frame
+          // (hole on +Y, head on −Z) before the hole is measured.
+          if (!extras.stoneAxis) {
+            applyStoneAxisBasis(gltf.scene, inferWearStoneAxis(gltf.scene));
+          }
+
           // Center on the metal band in XYZ so the unit hole shares the occluder axis.
           centerRingOnMetalHole(model, gltf.scene);
 
-          const extras = readRingModelExtras(gltf.scene);
-          const measuredInner = measureRingInnerDiameter(
-            model,
-            DEFAULT_INNER_TO_OUTER_DIAMETER,
-          );
-          const rawInnerDiameter =
-            typeof config.innerDiameterHint === 'number' && config.innerDiameterHint > 0
-              ? config.innerDiameterHint
-              : typeof extras.innerDiameter === 'number'
-                ? extras.innerDiameter
-                : measuredInner;
+          const rawInnerDiameter = resolveRawInnerDiameter(model, {
+            authored: extras.innerDiameter,
+            hint: config.innerDiameterHint,
+            fallbackRatio: DEFAULT_INNER_TO_OUTER_DIAMETER,
+          });
           normalizeRingToUnitHole(model, rawInnerDiameter, config.fitScale);
           // Re-seat after scale so numerical drift / gem AABB cannot pull the hole off origin.
           centerRingOnMetalHole(model, model, config.offset || {});
@@ -631,23 +741,21 @@ export default function Home() {
           model.userData.wearClearance = config.wearClearance;
           model.userData.sku = sku;
           model.userData.stoneAxis = '-Z';
-          if (extras.stoneAxis) model.userData.stoneAxisSource = extras.stoneAxis;
+          model.userData.stoneAxisSource =
+            extras.stoneAxis ||
+            (typeof gltf.scene.userData.stoneAxisSource === 'string'
+              ? gltf.scene.userData.stoneAxisSource
+              : '-Z');
 
-          const metalTint = extras.metalTint || '#c2c2c3';
-          const metalMaterial = new THREE.MeshPhysicalMaterial({
-            color: new THREE.Color(metalTint),
-            metalness: 1,
-            roughness: 0.08,
-            clearcoat: 0.35,
-            clearcoatRoughness: 0.12,
-            envMapIntensity: 1.55,
-            side: THREE.FrontSide,
-            depthWrite: true,
-          });
-          const diamondMaterials: THREE.ShaderMaterial[] = [];
-          const diamondBvhs = new Set<{ dispose: () => void }>();
+          rebuildTemplateGems(model);
+
+          const activeMetal =
+            METAL_OPTIONS.find((m) => m.id === metalColorRef.current) ||
+            METAL_OPTIONS[0];
+          const metalMaterial = createMetalMaterial(activeMetal);
+          ringMetalMaterialsRef.current = [metalMaterial];
+          const diamondMaterials: THREE.Material[] = [];
           ringDiamondMaterialsRef.current = diamondMaterials;
-          ringDiamondBvhsRef.current = diamondBvhs;
           const supersededMaterials = new Set<THREE.Material>();
           let usesMetalMaterial = false;
           const gemMeshes: THREE.Mesh[] = [];
@@ -721,80 +829,48 @@ export default function Home() {
           setModelLoadingState({
             status: 'loading',
             progress: 88,
-            message: gemMeshes.length
-              ? 'Generating diamond optics…'
-              : '3D ring ready',
+            message: 'Applying diamond material…',
           });
 
-          let initialDiamondEnv = ringEnvironmentAssetsRef.current?.diamond;
-          if (!initialDiamondEnv) {
-            initialDiamondEnv = createFallbackEnvironment();
-            fallbackDiamondEnvRef.current = initialDiamondEnv;
+          const initialDiamondEnv = ringEnvironmentAssetsRef.current?.diamond ?? fallbackDiamondEnvRef.current;
+          const diamondCube = diamondCubeEnvRef.current;
+          
+          const sharedDiamondMaterial = createFallbackDiamondMaterial();
+          if (initialDiamondEnv) {
+            sharedDiamondMaterial.envMap = initialDiamondEnv;
+            sharedDiamondMaterial.needsUpdate = true;
           }
 
-          const touchDevice = navigator.maxTouchPoints > 0;
-          const maxLeafTriangles = touchDevice ? 4 : 1;
-          const sharedBvhBySignature = new Map<
-            string,
-            { bvh: { dispose: () => void }; material: THREE.ShaderMaterial }
-          >();
-          const yieldToMain = () =>
-            new Promise<void>((resolve) => {
-              if (typeof requestAnimationFrame === 'function') {
-                requestAnimationFrame(() => resolve());
-              } else {
-                setTimeout(resolve, 0);
-              }
-            });
-
-          for (let i = 0; i < gemMeshes.length; i++) {
-            if (generation !== resourceGenerationRef.current) break;
-            const object = gemMeshes[i];
-            const signature = geometrySignature(object.geometry);
-            let diamondMaterial: THREE.Material;
-            try {
-              const shared = sharedBvhBySignature.get(signature);
-              if (shared) {
-                diamondMaterial = shared.material;
-              } else {
-                const { bvh } = createDiamondBVH(object.geometry, {
-                  maxLeafTriangles,
+          for (const object of gemMeshes) {
+            object.geometry = flattenGemFacets(object.geometry);
+            if (diamondCube) {
+              try {
+                const dMat = new DiamondMaterial({
+                  geometry: object.geometry,
+                  envMap: diamondCube,
                 });
-                diamondBvhs.add(bvh);
-                const shader = createProjectDiamondMaterial(
-                  initialDiamondEnv,
-                  bvh,
-                ) as THREE.ShaderMaterial;
-                diamondMaterials.push(shader);
-                sharedBvhBySignature.set(signature, { bvh, material: shader });
-                diamondMaterial = shader;
+                object.material = dMat;
+                diamondMaterials.push(dMat);
+              } catch (err) {
+                console.warn('DiamondMaterial init failed, using fallback:', err);
+                object.material = sharedDiamondMaterial;
+                if (!diamondMaterials.includes(sharedDiamondMaterial)) {
+                  diamondMaterials.push(sharedDiamondMaterial);
+                }
               }
-            } catch (error) {
-              console.warn(
-                'Diamond ray tracing unavailable; using reflective stone material.',
-                error,
-              );
-              diamondMaterial = createFallbackDiamondMaterial();
+            } else {
+              object.material = sharedDiamondMaterial;
+              if (!diamondMaterials.includes(sharedDiamondMaterial)) {
+                diamondMaterials.push(sharedDiamondMaterial);
+              }
             }
-            diamondMaterial.depthWrite = true;
-            object.material = diamondMaterial;
-
-            if (i % 4 === 3) {
-              setModelLoadingState({
-                status: 'loading',
-                progress: Math.round(88 + ((i + 1) / gemMeshes.length) * 10),
-                message: 'Generating diamond optics…',
-              });
-              await yieldToMain();
-            }
+            object.onBeforeRender = () => {
+              if (object.material && typeof (object.material as any).updateFromMesh === 'function') {
+                (object.material as any).updateFromMesh(object);
+              }
+            };
           }
 
-          if (generation !== resourceGenerationRef.current) {
-            disposeModelResources(model);
-            throw new DOMException('Ring load was cancelled.', 'AbortError');
-          }
-
-          // Drop the shared placeholder once every gem has a real material.
           let placeholderStillUsed = false;
           model.traverse((object) => {
             if (object instanceof THREE.Mesh && object.material === placeholderStone) {
@@ -804,7 +880,6 @@ export default function Home() {
           if (!placeholderStillUsed) placeholderStone.dispose();
 
           ringDiamondMaterialsRef.current = diamondMaterials;
-          ringDiamondBvhsRef.current = diamondBvhs;
 
           if (renderer && scene && camera) {
             try {
@@ -815,6 +890,14 @@ export default function Home() {
           }
 
           setModelLoadingState({ status: 'ready', progress: 100, message: '3D ring ready' });
+          // #region agent log
+          dbgRing('C', 'page.tsx:loadRingModel', 'ring_glb_ready', {
+            sku,
+            gemCount: gemMeshes.length,
+            diamondShaders: diamondMaterials.length,
+            hasGroup: !!ringGroupRef.current,
+          });
+          // #endregion
           setTimeout(() => {
             setModelLoadingState((prev) => (prev.status === 'ready' ? { ...prev, status: 'idle' } : prev));
           }, 1200);
@@ -825,12 +908,16 @@ export default function Home() {
           if (generation === resourceGenerationRef.current) {
             disposeModelResources(ringModelRef.current);
             ringModelRef.current = null;
-            for (const bvh of ringDiamondBvhsRef.current) bvh.dispose();
-            ringDiamondBvhsRef.current.clear();
             ringDiamondMaterialsRef.current = [];
             ringModelPromiseRef.current = null;
             ringLoadFailedRef.current = true;
             setModelLoadingState({ status: 'error', progress: 0, message: 'Unable to load ring model' });
+            // #region agent log
+            dbgRing('C', 'page.tsx:loadRingModel', 'ring_glb_failed', {
+              sku,
+              error: error instanceof Error ? error.message : String(error),
+            });
+            // #endregion
           }
           throw error;
         });
@@ -844,8 +931,6 @@ export default function Home() {
     // Preloaded models also own resources before they are added to the scene.
     disposeModelResources(ringModelRef.current);
     ringModelRef.current = null;
-    for (const bvh of ringDiamondBvhsRef.current) bvh.dispose();
-    ringDiamondBvhsRef.current.clear();
     ringDiamondMaterialsRef.current = [];
     fallbackDiamondEnvRef.current?.dispose();
     fallbackDiamondEnvRef.current = null;
@@ -866,6 +951,8 @@ export default function Home() {
     ringEnvironmentRef.current?.dispose();
     ringEnvironmentAssetsRef.current?.diamond.dispose();
     ringEnvironmentAssetsRef.current?.metal.dispose();
+    diamondCubeEnvRef.current?.dispose();
+    diamondCubeEnvRef.current = null;
     ringRendererRef.current?.dispose();
     ringGroupRef.current = null;
     ringOccluderRef.current = null;
@@ -882,7 +969,15 @@ export default function Home() {
   const renderRingModel = useCallback(
     (placement: RingModelPlacement | null) => {
       const canvas = ringCanvasRef.current;
-      if (!canvas || ringContextLostRef.current) return;
+      if (!canvas || ringContextLostRef.current) {
+        // #region agent log
+        dbgRing('C', 'page.tsx:renderRingModel', 'render_aborted', {
+          hasCanvas: !!canvas,
+          contextLost: ringContextLostRef.current,
+        });
+        // #endregion
+        return;
+      }
 
       const ringSceneCtx = initRingScene();
       if (!ringSceneCtx) return;
@@ -890,6 +985,22 @@ export default function Home() {
       const ring = ringGroupRef.current;
 
       if (!placement || !modelEnabledRef.current) {
+        // #region agent log
+        const now = performance.now();
+        const sig = `hide|p=${!!placement}|en=${modelEnabledRef.current}|mode=${uiModeRef.current}|phase=${photoPhaseRef.current}`;
+        if (sig !== dbgRingLastRef.current.sig || now - dbgRingLastRef.current.at > 800) {
+          dbgRingLastRef.current = { at: now, sig };
+          dbgRing('E', 'page.tsx:renderRingModel', 'ring_hidden', {
+            hasPlacement: !!placement,
+            modelEnabled: modelEnabledRef.current,
+            uiMode: uiModeRef.current,
+            photoPhase: photoPhaseRef.current,
+            hasRingGroup: !!ring,
+            modelLoaded: !!ringModelRef.current,
+            loadFailed: ringLoadFailedRef.current,
+          });
+        }
+        // #endregion
         if (ring) ring.visible = false;
         if (occluder) occluder.visible = false;
         if (contactShadow) contactShadow.visible = false;
@@ -911,6 +1022,14 @@ export default function Home() {
       }
 
       if (!ring) {
+        // #region agent log
+        dbgRing('C', 'page.tsx:renderRingModel', 'ring_group_missing_trigger_load', {
+          loadFailed: ringLoadFailedRef.current,
+          hasPromise: !!ringModelPromiseRef.current,
+          modelRef: !!ringModelRef.current,
+          sku: ringStyleRef.current,
+        });
+        // #endregion
         if (ringLoadFailedRef.current) return;
         const loadingScene = scene;
         void loadRingModel(ringStyleRef.current)
@@ -930,6 +1049,11 @@ export default function Home() {
               }
             }
             group.add(model);
+            // #region agent log
+            dbgRing('C', 'page.tsx:renderRingModel', 'ring_group_attached', {
+              children: group.children.length,
+            });
+            // #endregion
           })
           .catch((error) => {
             if (ringSceneRef.current !== loadingScene) return;
@@ -954,8 +1078,6 @@ export default function Home() {
         if (!replaced) fallback.dispose();
         for (const material of shaders) material.dispose();
         ringDiamondMaterialsRef.current = [];
-        for (const bvh of ringDiamondBvhsRef.current) bvh.dispose();
-        ringDiamondBvhsRef.current.clear();
       }
 
       const worldUnitsPerPixel = RING_WORLD_HEIGHT / height;
@@ -997,12 +1119,7 @@ export default function Home() {
           ? model.userData.wearClearance
           : undefined;
       ring.scale.setScalar(ringWorldScale(fingerWorld, wearClearance));
-      for (const material of ringDiamondMaterialsRef.current) {
-        const cameraPosition = material.uniforms.cameraPos?.value;
-        if (cameraPosition instanceof THREE.Vector3) {
-          cameraPosition.copy(camera.position);
-        }
-      }
+
       renderer.render(scene, camera);
     },
     [loadRingEnvironments, loadRingModel],
@@ -1020,19 +1137,32 @@ export default function Home() {
   const clearSobelOverlay = useCallback(() => {
     sobelFingerEdgesRef.current = null;
     seatCrossPositionRef.current = ringSeatAlongRef.current;
+    mcpFilterRef.current.reset();
+    pipFilterRef.current.reset();
     smoothedFingerLandmarksRef.current = null;
   }, []);
 
-  // Clear size lock / pose so a new hand (or Refit) can calibrate from scratch.
-  const resetRingFit = useCallback(() => {
-    fingerFitFilterRef.current.reset();
+  // Drop smoothed pose so a new bone or hand does not inherit the last placement.
+  // Size-lock slots are left intact; Refit and camera stop clear those separately.
+  const resetTrackingPose = useCallback(() => {
     ringSurfaceRef.current.reset();
     ringPoseFilterRef.current.reset();
     handednessResolverRef.current.reset();
+    mcpFilterRef.current.reset();
+    pipFilterRef.current.reset();
+    palmFiltersRef.current.forEach((filter) => filter.reset());
     smoothedFingerLandmarksRef.current = null;
     clearSobelOverlay();
     renderRingModel(null);
   }, [clearSobelOverlay, renderRingModel]);
+
+  // Refit and a full reset clear every hand/finger size lock.
+  // Finger and hand scopes only remeasure the active slot.
+  const resetRingFit = useCallback((scope: 'full' | 'finger' | 'hand' = 'full') => {
+    if (scope === 'full') fingerFitFilterRef.current.reset();
+    else fingerFitFilterRef.current.relock(scope);
+    resetTrackingPose();
+  }, [resetTrackingPose]);
 
   const stopHandTracking = useCallback(() => {
     if (animationFrameRef.current !== null) {
@@ -1048,6 +1178,9 @@ export default function Home() {
     fingerFitFilterRef.current.reset();
     ringSurfaceRef.current.reset();
     handednessResolverRef.current.reset();
+    mcpFilterRef.current.reset();
+    pipFilterRef.current.reset();
+    palmFiltersRef.current.forEach((filter) => filter.reset());
     smoothedFingerLandmarksRef.current = null;
     skinMotionRef.current.reset();
     patchMotionRef.current.reset();
@@ -1070,7 +1203,7 @@ export default function Home() {
             delegate: 'CPU',
           },
           runningMode: 'VIDEO',
-          numHands: 1,
+          numHands: 2,
           minHandDetectionConfidence: 0.5,
           minHandPresenceConfidence: 0.55,
           minTrackingConfidence: 0.5,
@@ -1241,6 +1374,13 @@ export default function Home() {
       const offsetX = (width - renderedWidth) / 2;
       const offsetY = (height - renderedHeight) / 2;
       let ringPlacement: RingModelPlacement | null = null;
+      // #region agent log
+      let placementSkipReason: string | null = hands.length === 0 ? 'no_hands' : 'loop_no_placement';
+      let lastFacing = 0;
+      let lastEdgeConf: number | null = null;
+      let lastEdgeAgeMs: number | null = null;
+      let lastFitStatus = fingerFitFilterRef.current.status;
+      // #endregion
 
       for (const hand of hands) {
         const landmarks = hand.landmarks;
@@ -1258,6 +1398,9 @@ export default function Home() {
         const pointPip = screenLandmarks[pipIdx];
 
         if (!pointMcp || !pointPip) {
+          // #region agent log
+          placementSkipReason = 'missing_mcp_pip';
+          // #endregion
           smoothedFingerLandmarksRef.current = null;
           continue;
         }
@@ -1266,26 +1409,26 @@ export default function Home() {
         const prevSmoothed = smoothedFingerLandmarksRef.current;
         let pMcp = pointMcp;
         let pPip = pointPip;
-        if (prevSmoothed && now - prevSmoothed.time < 160) {
-          const dt = Math.max(0.001, Math.min(0.1, (now - prevSmoothed.time) / 1000));
-          const stepMcp = Math.hypot(pointMcp.x - prevSmoothed.mcp.x, pointMcp.y - prevSmoothed.mcp.y);
-          const stepPip = Math.hypot(pointPip.x - prevSmoothed.pip.x, pointPip.y - prevSmoothed.pip.y);
-          const hzMcp = stepMcp > 5 ? 26 : THREE.MathUtils.lerp(4.5, 26, Math.max(0, stepMcp - 1) / 4);
-          const hzPip = stepPip > 5 ? 26 : THREE.MathUtils.lerp(4.5, 26, Math.max(0, stepPip - 1) / 4);
-          const aMcp = 1 - Math.exp(-2 * Math.PI * hzMcp * dt);
-          const aPip = 1 - Math.exp(-2 * Math.PI * hzPip * dt);
-          pMcp = {
-            x: prevSmoothed.mcp.x + (pointMcp.x - prevSmoothed.mcp.x) * aMcp,
-            y: prevSmoothed.mcp.y + (pointMcp.y - prevSmoothed.mcp.y) * aMcp,
-          };
-          pPip = {
-            x: prevSmoothed.pip.x + (pointPip.x - prevSmoothed.pip.x) * aPip,
-            y: prevSmoothed.pip.y + (pointPip.y - prevSmoothed.pip.y) * aPip,
-          };
+        if (!prevSmoothed || now - prevSmoothed.time > 160) {
+          mcpFilterRef.current.reset();
+          pipFilterRef.current.reset();
         }
+        
+        pMcp = mcpFilterRef.current.filter(pointMcp, now);
+        pPip = pipFilterRef.current.filter(pointPip, now);
+
         smoothedFingerLandmarksRef.current = { mcp: pMcp, pip: pPip, time: now };
 
         const fingerEdges = sobelFingerEdgesRef.current;
+        // #region agent log
+        if (fingerEdges) {
+          lastEdgeConf = fingerEdges.confidence;
+          lastEdgeAgeMs = performance.now() - fingerEdges.revision;
+        } else {
+          lastEdgeConf = null;
+          lastEdgeAgeMs = null;
+        }
+        // #endregion
         const seatT = Math.min(
           SEAT_ALONG_MAX,
           Math.max(SEAT_ALONG_MIN, ringSeatAlongRef.current),
@@ -1304,21 +1447,40 @@ export default function Home() {
           perpendicularY,
         );
 
-        if (!perpendicularLength) continue;
+        if (!perpendicularLength) {
+          // #region agent log
+          placementSkipReason = 'zero_finger_axis';
+          // #endregion
+          continue;
+        }
 
         perpendicularX /= perpendicularLength;
         perpendicularY /= perpendicularLength;
 
         const stabilizedScreenLandmarks = [...screenLandmarks];
-        stabilizedScreenLandmarks[mcpIdx] = pMcp;
-        stabilizedScreenLandmarks[pipIdx] = pPip;
+        const keyAnchors = [0, 5, 9, 13, 17, mcpIdx, pipIdx];
+        for (const idx of keyAnchors) {
+          if (screenLandmarks[idx]) {
+            stabilizedScreenLandmarks[idx] = getAnchorFilter(idx).filter(screenLandmarks[idx], now);
+          }
+        }
+        pMcp = stabilizedScreenLandmarks[mcpIdx];
+        pPip = stabilizedScreenLandmarks[pipIdx];
 
         const surfacePose = solveRingPose(
           landmarks, stabilizedScreenLandmarks, hand.handedness, mode === 'user',
           ringPoseFilterRef.current.current()?.orientation,
-          { mcp: mcpIdx, pip: pipIdx },
+          { mcp: mcpIdx, pip: pipIdx, finger: targetFingerRef.current },
         );
-        if (!surfacePose) continue;
+        if (!surfacePose) {
+          // #region agent log
+          placementSkipReason = 'solveRingPose_null';
+          // #endregion
+          continue;
+        }
+        // #region agent log
+        lastFacing = surfacePose.facing;
+        // #endregion
         let edgeSample: { width: number; offset: number; revision: number; confidence: number } | undefined;
 
         if (fingerEdges) {
@@ -1363,17 +1525,27 @@ export default function Home() {
         }
         const fit = fingerFitFilterRef.current.update(
           surfacePose.handScale, surfacePose.facing, edgeSample, surfacePose.anchors,
+          { finger: targetFingerRef.current, hand: hand.handedness },
         );
-        if (!fit) continue;
+        // #region agent log
+        lastFitStatus = fingerFitFilterRef.current.status;
+        // #endregion
+        if (!fit) {
+          // #region agent log
+          placementSkipReason = `fit_null:${fingerFitFilterRef.current.status}:cal=${fingerFitFilterRef.current.calibrated}:edge=${edgeSample ? edgeSample.confidence.toFixed(2) : 'none'}:facing=${surfacePose.facing.toFixed(2)}`;
+          // #endregion
+          continue;
+        }
+        // #region agent log
+        placementSkipReason = null;
+        // #endregion
         const constrained = ringSurfaceRef.current.update(
-          surfacePose.orientation, surfacePose.anchors, surfacePose.fingerLength, fit.width,
+          surfacePose.orientation, surfacePose.anchors, surfacePose.fingerLength, fit.width, hand.handedness,
         );
-        // Same for Left and Right: MediaPipe winding vs model −Z needs a 180°
-        // spin about the finger so dorsal shows the setting and palm shows the
-        // rear shank. Occluder uses this orientation too.
-        const orientation = constrained.clone().multiply(
-          new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), Math.PI),
-        );
+        // Use tracking orientation as-is: dorsal → head (−Z) toward camera,
+        // palm → rear shank. Occluder/shadow share this frame. Flip is the only
+        // 180° override (model child rotation in renderRingModel).
+        const orientation = constrained.clone();
         // Bone-centered by default; only a small silhouette nudge is allowed.
         const lateral =
           Math.abs(fit.offset) <= fit.width * PLACEMENT_OFFSET_GATE
@@ -1402,6 +1574,44 @@ export default function Home() {
       }
 
       const stablePlacement = ringPoseFilterRef.current.update(ringPlacement, performance.now());
+      // #region agent log
+      {
+        const now = performance.now();
+        const visible = !!stablePlacement;
+        const sig = [
+          visible ? 'show' : 'noshow',
+          placementSkipReason ?? 'placed',
+          lastFitStatus,
+          fingerFitFilterRef.current.calibrated ? 'cal' : 'uncal',
+          `e=${lastEdgeConf?.toFixed(2) ?? 'n'}`,
+          `f=${lastFacing.toFixed(2)}`,
+          uiModeRef.current,
+        ].join('|');
+        if (!visible || sig !== dbgRingLastRef.current.sig || now - dbgRingLastRef.current.at > 1000) {
+          if (!visible || now - dbgRingLastRef.current.at > 400) {
+            dbgRingLastRef.current = { at: now, sig };
+            dbgRing(visible ? 'D' : 'A', 'page.tsx:drawPoints', visible ? 'placement_ok' : 'placement_blocked', {
+              hands: hands.length,
+              hasRawPlacement: !!ringPlacement,
+              hasStablePlacement: !!stablePlacement,
+              skipReason: placementSkipReason,
+              fitStatus: lastFitStatus,
+              calibrated: fingerFitFilterRef.current.calibrated,
+              edgeConfidence: lastEdgeConf,
+              edgeAgeMs: lastEdgeAgeMs,
+              facing: lastFacing,
+              minEdgeConf: MIN_FINGER_EDGE_CONFIDENCE,
+              modelLoaded: !!ringModelRef.current,
+              hasRingGroup: !!ringGroupRef.current,
+              loadFailed: ringLoadFailedRef.current,
+              uiMode: uiModeRef.current,
+              photoPhase: photoPhaseRef.current,
+              seatAlong: ringSeatAlongRef.current,
+            });
+          }
+        }
+      }
+      // #endregion
       if (showGuides) {
         const raw = sobelFingerEdgesRef.current;
         const age = raw ? performance.now() - raw.revision : Infinity;
@@ -1434,11 +1644,13 @@ export default function Home() {
         const edgeLabel = fresh
           ? `Raw: ${raw.reason} | score ${raw.confidence.toFixed(2)} | ${raw.support}/6 sections`
           : 'Raw: no usable edges';
+        const lockedHand = fitFilter.lockedHand;
         const fitLabel = !hands.length ? 'Show your hand to measure'
-          : fitFilter.calibrated ? 'Size locked - use Refit ring to measure again'
+          : fitFilter.relocking ? `Relocking ${lockedHand ? `${lockedHand} ` : ''}finger ${fitFilter.confirmationFrames}/${fitFilter.confirmationNeeded}`
+          : fitFilter.calibrated ? `Size locked${lockedHand ? ` (${lockedHand})` : ''} - use Refit ring to measure again`
           : !fresh || fitFilter.status === 'uncertain' ? 'Waiting for clear edges to fit ring'
           : fitFilter.status === 'side view' ? 'Face your palm or back of hand toward the camera'
-          : fitFilter.status === 'confirming' ? `Confirming edges ${fitFilter.confirmationFrames}/3`
+          : fitFilter.status === 'confirming' ? `Confirming edges ${fitFilter.confirmationFrames}/${fitFilter.confirmationNeeded}`
           : 'Clear edges accepted';
         const lines = [edgeLabel, fitLabel, 'Dashed / squares: raw | Yellow: filtered'];
         context.font = '12px Arial, sans-serif';
@@ -1598,11 +1810,12 @@ export default function Home() {
 
       // Hold Left/Right through brief classifier flicker, but accept a real
       // hand swap after several agreeing frames (or after the hand left).
-      const HAND_SWAP_CONFIRM_FRAMES = 10;
+      const HAND_SWAP_CONFIRM_FRAMES = 2;
       let trackedHandedness: Handedness | null = null;
       let lastHandSeenAt = 0;
       let pendingHandedness: Handedness | null = null;
       let pendingHandednessFrames = 0;
+      let lastWristPos: { x: number; y: number } | null = null;
       const renderPoints = () => {
         const video = videoRef.current;
 
@@ -1677,33 +1890,81 @@ export default function Home() {
             detectionContext.drawImage(preview, 0, 0, inputSize.width, inputSize.height);
 
             const result = handLandmarker.detectForVideo(detectionCanvas, now);
-            const imageLandmarks = result.landmarks[0];
-            const worldLandmarks = result.worldLandmarks[0];
-            const categoryName = result.handedness[0]?.[0]?.categoryName;
-            if (imageLandmarks) {
-              const mappedLandmarks = imageLandmarks.map((point, index) => {
-                const worldPoint = worldLandmarks?.[index];
-                return {
-                  x: point.x,
-                  y: point.y,
-                  z: point.z,
-                  worldX: worldPoint?.x,
-                  worldY: worldPoint?.y,
-                  worldZ: worldPoint?.z,
-                };
-              });
-              // Unmirrored detection: canonicalize MediaPipe labels per camera,
-              // then let palm winding override sustained mislabels.
-              const resolvedHandedness = handednessResolverRef.current.resolve(
-                categoryName,
-                mode,
-                mappedLandmarks,
-              );
+            const handsCount = result.landmarks?.length ?? 0;
+
+            let chosenMappedLandmarks: HandPoint[] | null = null;
+            let chosenHandedness: Handedness | null = null;
+
+            if (handsCount > 0) {
+              const candidates: {
+                mappedLandmarks: HandPoint[];
+                handedness: Handedness | null;
+                score: number;
+              }[] = [];
+
+              for (let k = 0; k < handsCount; k++) {
+                const imageLandmarks = result.landmarks[k];
+                const worldLandmarks = result.worldLandmarks?.[k];
+                const categoryName = result.handedness?.[k]?.[0]?.categoryName;
+                if (!imageLandmarks) continue;
+
+                const mapped = imageLandmarks.map((point, index) => {
+                  const worldPoint = worldLandmarks?.[index];
+                  return {
+                    x: point.x,
+                    y: point.y,
+                    z: point.z,
+                    worldX: worldPoint?.x,
+                    worldY: worldPoint?.y,
+                    worldZ: worldPoint?.z,
+                  };
+                });
+
+                const resolved = handednessResolverRef.current.resolve(
+                  categoryName,
+                  mode,
+                  mapped,
+                );
+
+                let proxScore = 0;
+                const wrist = mapped[0];
+                if (lastWristPos && wrist) {
+                  const dist = Math.hypot(wrist.x - lastWristPos.x, wrist.y - lastWristPos.y);
+                  proxScore = Math.max(0, 8 * (1 - dist * 2.5));
+                }
+
+                const centerDist = wrist ? Math.hypot(wrist.x - 0.5, wrist.y - 0.5) : 1;
+                const centerScore = Math.max(0, 3 * (1 - centerDist));
+                const contScore = resolved && resolved === trackedHandedness ? 4 : 0;
+
+                candidates.push({
+                  mappedLandmarks: mapped,
+                  handedness: resolved,
+                  score: proxScore + centerScore + contScore,
+                });
+              }
+
+              if (candidates.length > 0) {
+                candidates.sort((a, b) => b.score - a.score);
+                const best = candidates[0];
+                chosenMappedLandmarks = best.mappedLandmarks;
+                chosenHandedness = best.handedness;
+              }
+            }
+
+            if (chosenMappedLandmarks) {
+              const mappedLandmarks = chosenMappedLandmarks;
+              const resolvedHandedness = chosenHandedness;
+              if (mappedLandmarks[0]) {
+                lastWristPos = { x: mappedLandmarks[0].x, y: mappedLandmarks[0].y };
+              }
+
               if (resolvedHandedness) {
                 const handAbsent = !trackedHandedness || now - lastHandSeenAt > 300;
                 if (handAbsent) {
                   if (trackedHandedness && trackedHandedness !== resolvedHandedness) {
-                    resetRingFit();
+                    fingerFitFilterRef.current.select(targetFingerRef.current, resolvedHandedness);
+                    resetTrackingPose();
                   }
                   trackedHandedness = resolvedHandedness;
                   pendingHandedness = null;
@@ -1717,14 +1978,19 @@ export default function Home() {
                     trackedHandedness = resolvedHandedness;
                     pendingHandedness = null;
                     pendingHandednessFrames = 0;
-                    resetRingFit();
+                    fingerFitFilterRef.current.select(targetFingerRef.current, resolvedHandedness);
+                    resetTrackingPose();
                   }
                 } else {
                   pendingHandedness = resolvedHandedness;
                   pendingHandednessFrames = 1;
                 }
               }
-              detectedHandedness = trackedHandedness;
+              // Immediately use confirmed candidate during swap to avoid inverted rendering
+              detectedHandedness = pendingHandednessFrames > 1 && pendingHandedness
+                ? pendingHandedness
+                : (trackedHandedness ?? resolvedHandedness);
+
               lastHandSeenAt = now;
               detectedLandmarks = mappedLandmarks;
             }
@@ -1809,8 +2075,8 @@ export default function Home() {
       drawPoints,
       getHandLandmarker,
       getOpenCv,
-      resetRingFit,
       renderRingModel,
+      resetTrackingPose,
       stopHandTracking,
       updateHorizontalSobel,
     ],
@@ -2053,6 +2319,7 @@ export default function Home() {
           }
         }
         zoomRef.current = 1;
+        setZoomLevel(1);
 
         if (videoRef.current) {
           videoRef.current.muted = true;
@@ -2149,10 +2416,26 @@ export default function Home() {
       if (finger === targetFingerRef.current) return;
       targetFingerRef.current = finger;
       setTargetFinger(finger);
-      resetRingFit();
+      const def = getFingerDef(finger);
+      const seat = fingerSeatsRef.current[finger] ?? def.defaultSeat;
+      ringSeatAlongRef.current = seat;
+      seatCrossPositionRef.current = seat;
+      setRingSeatAlong(seat);
+      fingerFitFilterRef.current.select(finger);
+      resetTrackingPose();
     },
-    [resetRingFit],
+    [resetTrackingPose],
   );
+
+  const selectMetalColor = useCallback((color: MetalColor) => {
+    metalColorRef.current = color;
+    setMetalColor(color);
+    const option = METAL_OPTIONS.find((m) => m.id === color);
+    if (!option) return;
+    for (const mat of ringMetalMaterialsRef.current) {
+      applyMetalPreset(mat as THREE.MeshPhysicalMaterial, option);
+    }
+  }, []);
 
   const toggleTheme = () => {
     setTheme((current) => (current === 'dark' ? 'light' : 'dark'));
@@ -2167,9 +2450,8 @@ export default function Home() {
     disposeModelResources(ringModelRef.current);
     ringModelRef.current = null;
     ringGroupRef.current = null;
-    for (const bvh of ringDiamondBvhsRef.current) bvh.dispose();
-    ringDiamondBvhsRef.current.clear();
     ringDiamondMaterialsRef.current = [];
+    ringMetalMaterialsRef.current = [];
     ringModelPromiseRef.current = null;
     ringLoadFailedRef.current = false;
   }, []);
@@ -2601,6 +2883,30 @@ export default function Home() {
                 </div>
               </div>
 
+              <div className="tryon-panel-row" role="group" aria-label="Metal color">
+                <span className="tryon-label">Metal</span>
+                <div className="metal-pills">
+                  {METAL_OPTIONS.map((option) => (
+                    <button
+                      key={option.id}
+                      type="button"
+                      className={`metal-pill ${metalColor === option.id ? 'active' : ''}`}
+                      data-metal={option.id}
+                      onClick={() => selectMetalColor(option.id)}
+                      aria-pressed={metalColor === option.id}
+                      title={`Select ${option.label}`}
+                    >
+                      <span
+                        className="metal-swatch"
+                        style={{ background: option.swatch }}
+                        aria-hidden="true"
+                      />
+                      <span>{option.label}</span>
+                    </button>
+                  ))}
+                </div>
+              </div>
+
               <div className="tryon-panel-row tryon-panel-row--tools">
                 <button
                   type="button"
@@ -2675,7 +2981,7 @@ export default function Home() {
                 <button
                   type="button"
                   className="tryon-tool-btn"
-                  onClick={resetRingFit}
+                  onClick={() => resetRingFit('full')}
                   disabled={cameraState !== 'active'}
                   title="Refit ring to finger"
                 >
@@ -2700,12 +3006,34 @@ export default function Home() {
                   aria-label="Ring placement along finger"
                   onChange={(event) => {
                     const next = Number(event.target.value) / 100;
+                    fingerSeatsRef.current[targetFingerRef.current] = next;
                     ringSeatAlongRef.current = next;
                     seatCrossPositionRef.current = next;
                     setRingSeatAlong(next);
                   }}
                 />
                 <span className="seat-slider-end">Tip</span>
+              </div>
+
+              <div
+                className="tryon-panel-row tryon-panel-row--seat"
+                title="Adjust camera zoom"
+              >
+                <span className="tryon-label">Zoom</span>
+                <span className="seat-slider-end">1x</span>
+                <input
+                  type="range"
+                  className="seat-slider"
+                  min={10}
+                  max={30}
+                  step={1}
+                  value={Math.round(zoomLevel * 10)}
+                  aria-label="Camera zoom level"
+                  onChange={(event) => {
+                    void applyZoom(Number(event.target.value) / 10);
+                  }}
+                />
+                <span className="seat-slider-end">3x</span>
               </div>
 
               <div

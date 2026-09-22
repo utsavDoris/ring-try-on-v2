@@ -1,21 +1,27 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { Box3, Euler, Group, Mesh, MeshBasicMaterial, Quaternion, Raycaster, Vector3, OrthographicCamera } from 'three';
-import { detectionSize, solveRingPose, projectedFingerAxis, RingPoseFilter, FingerFitFilter, RingSurfaceConstraint, anatomicalHandedness, swapHandedness, HandednessResolver, MAX_FIT_OFFSET_RATIO, MAX_LOCK_OFFSET_RATIO, PLACEMENT_OFFSET_GATE } from '../app/ring-tracking.ts';
+import { detectionSize, solveRingPose, projectedFingerAxis, RingPoseFilter, FingerFitFilter, RingSurfaceConstraint, anatomicalHandedness, swapHandedness, HandednessResolver, anatomicalChiralityFromWorld, MAX_FIT_OFFSET_RATIO, MAX_LOCK_OFFSET_RATIO, PLACEMENT_OFFSET_GATE } from '../app/ring-tracking.ts';
 import {
   DEFAULT_INNER_TO_OUTER_DIAMETER,
   OCCLUSION_LENGTH_RATIO,
   OCCLUSION_RADIUS_RATIO,
   WEAR_CLEARANCE,
+  applyStoneAxisBasis,
   centerRingOnMetalHole,
   createFingerOccluderGeometry,
+  inferWearStoneAxis,
+  measureMetalBounds,
   measureRingInnerDiameter,
   normalizeRingToUnitHole,
   readRingModelExtras,
   resolveFingerWidthPx,
+  resolveRawInnerDiameter,
   ringWorldScale,
 } from '../app/ring-model.ts';
 import { loadRingGltf } from './load-ring-gltf.mjs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 const near = (a, b, tolerance = 1e-6) => assert.ok(Math.abs(a - b) <= tolerance, `${a} != ${b} (tolerance ${tolerance})`);
 // A metric left hand with its dorsal side facing the camera (index on the
@@ -203,6 +209,58 @@ test('small trustworthy lateral offset still locks and stays within placement ga
   assert.ok(Math.abs(result.offset) <= 40 * PLACEMENT_OFFSET_GATE + 1e-6);
 });
 
+test('moderate off-center edges lock width for left and right hands', () => {
+  const offset = 40 * 0.18;
+  assert.ok(offset / 40 > 0.12);
+  assert.ok(offset / 40 < MAX_LOCK_OFFSET_RATIO);
+  for (const left of [false, true]) {
+    const fit = new FingerFitFilter();
+    const hand = left ? 'Right' : 'Left';
+    const anchors = sample({ left }).pose.anchors;
+    let result;
+    for (const revision of [0, 40, 80]) {
+      result = fit.update(
+        100, 1,
+        { width: 40, offset, revision, confidence: 1 },
+        anchors,
+        { finger: 'ring', hand },
+      );
+    }
+    assert.equal(fit.calibrated, true);
+    assert.ok(result);
+    near(result.width, 40);
+    // Diameter locks; the nudge stays outside the placement gate so the ring stays on the bone.
+    assert.ok(Math.abs(result.offset) <= 40 * MAX_FIT_OFFSET_RATIO + 1e-6);
+    assert.ok(Math.abs(result.offset) > 40 * PLACEMENT_OFFSET_GATE);
+  }
+});
+
+test('each hand keeps its own palm scale when switching back', () => {
+  const fit = new FingerFitFilter();
+  const rightAnchors = sample({ pixelsPerMeter: 2000 }).pose.anchors;
+  const leftAnchors = sample({ left: true, pixelsPerMeter: 3200 }).pose.anchors;
+  const edge = (revision, width) => ({ width, offset: 0, revision, confidence: 1 });
+  let right;
+  for (const revision of [0, 40]) {
+    right = fit.update(100, 1, edge(revision, 40), rightAnchors, { finger: 'ring', hand: 'Right' });
+  }
+  assert.equal(fit.calibrated, true);
+  near(right.width, 40);
+  fit.update(100, 1, edge(80, 52), leftAnchors, { finger: 'ring', hand: 'Left' });
+  let left;
+  for (let i = 0; i < 8; i += 1) {
+    left = fit.update(100, 1, edge(120 + i * 40, 52), leftAnchors, { finger: 'ring', hand: 'Left' });
+  }
+  assert.equal(fit.lockedHand, 'Left');
+  assert.ok(left);
+  near(left.width, 52);
+  fit.update(100, 1, edge(500, 40), rightAnchors, { finger: 'ring', hand: 'Right' });
+  const restored = fit.update(100, 1, edge(540, 40), rightAnchors, { finger: 'ring', hand: 'Right' });
+  assert.equal(fit.lockedHand, 'Right');
+  assert.equal(fit.calibrated, true);
+  near(restored.width, 40, 1);
+});
+
 test('sustained off-bone edges after lock reset calibration', () => {
   const fit = new FingerFitFilter();
   for (const revision of [0, 40, 80]) {
@@ -315,8 +373,15 @@ test('fast translation and reversal stay with the finger on the first frame', ()
 
 test('filtering a turn cannot shrink the ring with the foreshortened palm', () => {
   const filter = new RingPoseFilter();
-  for (let i = 0; i < 80; i++) {
-    const raw = placement(sample({ yaw: i * 0.018 }));
+  // Size lock supplies a stable target width; pose turns must not shrink display scale.
+  for (let i = 0; i < 30; i++) {
+    const warm = placement(sample());
+    warm.width = 40;
+    filter.update(warm, i * 16.667);
+  }
+  for (let i = 30; i < 80; i++) {
+    const raw = placement(sample({ yaw: (i - 30) * 0.018 }));
+    raw.width = 40;
     const result = filter.update(raw, i * 16.667);
     near(result.width, 40, 0.05);
   }
@@ -331,16 +396,57 @@ test('small continuous movement does not wait for a large distance threshold', (
   }
 });
 
-test('RingPoseFilter passes fit width through without re-smoothing', () => {
+test('RingPoseFilter holds tiny width flicker and eases toward a sustained jump', () => {
   const filter = new RingPoseFilter();
   const initial = placement(sample());
-  filter.update(initial, 0);
-  for (let i = 1; i < 40; i++) {
-    const raw = placement(sample({ yaw: i * 0.04, tx: 420 + i }));
-    raw.width = 40 + (i % 5) * 2;
-    const result = filter.update(raw, i * 16.667);
-    near(result.width, raw.width, 1e-9);
+  initial.width = 40;
+  // Warm past ease-in so deadband/catch-up behavior is measurable.
+  for (let i = 0; i < 30; i++) {
+    filter.update({ ...initial, width: 40 }, i * 16.667);
   }
+  let held = null;
+  for (let i = 30; i < 50; i++) {
+    const flicker = 40 * (i % 2 ? 1.015 : 0.985);
+    held = filter.update({ ...initial, width: flicker }, i * 16.667);
+    near(held.width, 40, 0.5);
+  }
+  assert.ok(held);
+  // Sustained +20% target must ease (not snap on the first frame).
+  const jumped = filter.update({ ...initial, width: 48 }, 50 * 16.667);
+  assert.ok(jumped.width < 47, `expected ease not snap, got ${jumped.width}`);
+  let caught = jumped;
+  for (let i = 51; i < 90; i++) {
+    caught = filter.update({ ...initial, width: 48 }, i * 16.667);
+  }
+  assert.ok(Math.abs(caught.width / 48 - 1) < 0.03, `expected catch-up toward 48, got ${caught.width}`);
+});
+
+test('RingPoseFilter eases in display width on first lock', () => {
+  const filter = new RingPoseFilter();
+  const raw = placement(sample());
+  raw.width = 40;
+  const first = filter.update(raw, 0);
+  assert.ok(first.width < 40);
+  assert.ok(first.width > 30);
+  near(first.width, 40 * 0.85, 1e-6);
+  let later = first;
+  for (let i = 1; i <= 40; i++) {
+    later = filter.update({ ...raw, width: 40 }, i * 16.667);
+  }
+  assert.ok(later.width > first.width, 'width should rise toward the locked target');
+  near(later.width, 40, 0.5);
+});
+
+test('RingPoseFilter keeps smoothing XY when width target jumps', () => {
+  const filter = new RingPoseFilter();
+  const base = placement(sample());
+  base.width = 40;
+  for (let i = 0; i < 20; i++) filter.update({ ...base, width: 40 }, i * 16.667);
+  const moved = { ...base, x: base.x + 2, width: 52 };
+  const result = filter.update(moved, 20 * 16.667);
+  // Position still blends; width does not snap to the new target in one frame.
+  assert.ok(Math.abs(result.x - moved.x) < 2.1);
+  assert.ok(result.width < 51);
 });
 
 test('FingerFitFilter holds locked size when palm distance briefly fails', () => {
@@ -413,10 +519,22 @@ test('loss and reacquisition do not animate from an old location', () => {
   const filter = new RingPoseFilter();
   filter.update(placement(sample()), 0);
   assert.ok(filter.update(null, 30));
-  assert.equal(filter.update(null, 60), null);
+  assert.ok(filter.update(null, 300), 'brief gaps keep the last pose for ~400ms');
+  assert.equal(filter.update(null, 450), null);
   const moved = placement(sample({ tx: 600, ty: 1100 }));
-  const reacquired = filter.update(moved, 180);
+  const reacquired = filter.update(moved, 600);
   near(reacquired.x, moved.x); near(reacquired.y, moved.y);
+});
+
+test('RingPoseFilter holds last pose through a brief MediaPipe gap', () => {
+  const filter = new RingPoseFilter();
+  const first = placement(sample());
+  filter.update(first, 0);
+  const held = filter.update(null, 200);
+  assert.ok(held);
+  near(held.x, first.x);
+  near(held.y, first.y);
+  assert.equal(filter.update(null, 401), null);
 });
 
 test('the overlay does not add stone parallax when translated to a corner', () => {
@@ -450,6 +568,61 @@ test('LR1844 inner diameter is measured from the metal band', async () => {
       for (const m of Array.isArray(o.material) ? o.material : [o.material]) m.dispose();
     }
   });
+});
+
+test('every catalog ring wears like LR1844: hole along the finger, head on -Z', async () => {
+  const root = join(dirname(fileURLToPath(import.meta.url)), '..', 'public', 'models');
+  const files = ['LR1844.glb', 'LR1025.glb', 'LR1032.glb', 'LR1035.glb', 'LR1101.glb', 'LR1157.glb'];
+  for (const file of files) {
+    const asset = await loadRingGltf(join(root, file));
+    const model = new Group();
+    model.add(asset.scene);
+    model.updateMatrixWorld(true);
+    const extras = readRingModelExtras(asset.scene);
+    if (!extras.stoneAxis) {
+      const inferred = inferWearStoneAxis(asset.scene);
+      assert.equal(inferred, '+Y', `${file} should be a +Y head / Z hole`);
+      applyStoneAxisBasis(asset.scene, inferred);
+    }
+    centerRingOnMetalHole(model, asset.scene);
+    const metal = measureMetalBounds(model);
+    assert.ok(metal, `${file} metal bounds`);
+    assert.ok(metal.size.y < metal.size.x * 0.85, `${file} finger axis is not the thin band (y=${metal.size.y} x=${metal.size.x})`);
+    assert.ok(metal.size.y < metal.size.z * 0.85, `${file} head axis collapsed into the band`);
+    const raw = resolveRawInnerDiameter(model, {
+      authored: extras.innerDiameter,
+      hint: metal.size.x * DEFAULT_INNER_TO_OUTER_DIAMETER,
+    });
+    if (file === 'LR1844.glb') {
+      near(raw, 1.91, 0.02);
+    } else {
+      const fallback = metal.size.x * DEFAULT_INNER_TO_OUTER_DIAMETER;
+      assert.ok(Math.abs(raw - fallback) > 0.01, `${file} still used the outer-width fallback ${fallback} (raw ${raw})`);
+      assert.ok(raw > metal.size.x * 0.5 && raw < metal.size.x * 0.95, `${file} inner ${raw} vs outer ${metal.size.x}`);
+    }
+    if (file !== 'LR1035.glb') {
+      let weight = 0;
+      const gem = new Vector3();
+      model.updateMatrixWorld(true);
+      model.traverse((object) => {
+        if (!object.isMesh || !/gem|diamond|stone/i.test(`${object.name} ${object.material?.name || ''}`)) return;
+        const box = new Box3().setFromObject(object);
+        const size = box.getSize(new Vector3());
+        const volume = Math.abs(size.x * size.y * size.z);
+        gem.addScaledVector(box.getCenter(new Vector3()), volume);
+        weight += volume;
+      });
+      gem.multiplyScalar(1 / weight);
+      assert.ok(gem.z < -0.25, `${file} head z=${gem.z}`);
+      assert.ok(Math.abs(gem.z) > Math.abs(gem.y), `${file} head still along the finger`);
+    }
+    model.traverse((object) => {
+      if (object.isMesh) {
+        object.geometry.dispose();
+        for (const material of [].concat(object.material)) material.dispose?.();
+      }
+    });
+  }
 });
 
 test('LR1844 normalizes to a unit hole then scales with wear clearance', async () => {
@@ -619,6 +792,26 @@ test('a real camera-distance change resizes the locked fit in both directions', 
     const anchors = sample({ pixelsPerMeter: 2000 * factor, yaw: 0.9 }).pose.anchors;
     for (let i = 0; i < 30; i++) result = filter.update(100, 0.6, undefined, anchors);
     assert.ok(Math.abs(result.width / (40 * factor) - 1) <= 0.026, `distance scale ${result.width}`);
+  }
+});
+
+test('a large sustained camera-distance step catches up within a short window', () => {
+  const expectNear = (actual, expected, tol = 0.08) => {
+    assert.ok(Math.abs(actual / expected - 1) <= tol, `got ${actual}, expected ~${expected}`);
+  };
+  {
+    const filter = lockedFit();
+    const far = sample({ pixelsPerMeter: 1200 }).pose.anchors;
+    let result;
+    for (let i = 0; i < 30; i++) result = filter.update(100, 0.85, undefined, far);
+    expectNear(result.width, 24);
+  }
+  {
+    const filter = lockedFit();
+    const near = sample({ pixelsPerMeter: 3200 }).pose.anchors;
+    let result;
+    for (let i = 0; i < 30; i++) result = filter.update(100, 0.85, undefined, near);
+    expectNear(result.width, 64);
   }
 });
 
@@ -802,4 +995,137 @@ test('high-frequency landmark noise on stationary hand produces rock-solid ring 
   assert.ok(rmsError < 0.65, `RMS position jitter should be suppressed: ${rmsError}`);
   assert.ok(maxAngularDeviation < 0.015, `Angular wobble should be suppressed: ${maxAngularDeviation} rad`);
 });
+
+test('anatomicalChiralityFromWorld accurately identifies left vs right hands with 3D thumb across yaw/pitch', () => {
+  // Construct metric 3D hands with wrist(0), index(5), pinky(17), and thumb(2)
+  for (const yaw of [-0.6, -0.3, 0, 0.3, 0.6]) {
+    for (const pitch of [-0.4, 0, 0.4]) {
+      const q = new Quaternion().setFromEuler(new Euler(pitch, yaw, 0, 'ZYX'));
+
+      // Right hand: index on left (-X), pinky on right (+X), thumb on radial side (-X, -Y, -Z)
+      const rightWorld = [
+        new Vector3(0, -0.055, 0).applyQuaternion(q), // wrist 0
+        new Vector3(0, 0, 0), // 1
+        new Vector3(-0.045, -0.02, -0.01).applyQuaternion(q), // thumb 2
+        new Vector3(0, 0, 0), // 3
+        new Vector3(0, 0, 0), // 4
+        new Vector3(-0.035, 0.005, 0).applyQuaternion(q), // index 5
+        ...Array.from({ length: 11 }, () => new Vector3(0, 0, 0)),
+        new Vector3(0.032, 0, 0).applyQuaternion(q), // pinky 17
+      ];
+      const rightLandmarks = rightWorld.map((p) => ({
+        x: p.x, y: p.y, z: p.z,
+        worldX: p.x, worldY: p.y, worldZ: p.z,
+      }));
+      assert.equal(anatomicalChiralityFromWorld(rightLandmarks), 'Right', `Should identify Right hand at yaw=${yaw}, pitch=${pitch}`);
+
+      // Left hand: mirror reflection across X
+      const leftWorld = [
+        new Vector3(0, -0.055, 0).applyQuaternion(q), // wrist 0
+        new Vector3(0, 0, 0), // 1
+        new Vector3(0.045, -0.02, -0.01).applyQuaternion(q), // thumb 2
+        new Vector3(0, 0, 0), // 3
+        new Vector3(0, 0, 0), // 4
+        new Vector3(0.035, 0.005, 0).applyQuaternion(q), // index 5
+        ...Array.from({ length: 11 }, () => new Vector3(0, 0, 0)),
+        new Vector3(-0.032, 0, 0).applyQuaternion(q), // pinky 17
+      ];
+      const leftLandmarks = leftWorld.map((p) => ({
+        x: p.x, y: p.y, z: p.z,
+        worldX: p.x, worldY: p.y, worldZ: p.z,
+      }));
+      assert.equal(anatomicalChiralityFromWorld(leftLandmarks), 'Left', `Should identify Left hand at yaw=${yaw}, pitch=${pitch}`);
+    }
+  }
+});
+
+test('solveRingPose accurately places rings on all 5 fingers for both Left and Right hands', () => {
+  const allFingers = [
+    { finger: 'thumb', mcp: 2, pip: 3 },
+    { finger: 'index', mcp: 5, pip: 6 },
+    { finger: 'middle', mcp: 9, pip: 10 },
+    { finger: 'ring', mcp: 13, pip: 14 },
+    { finger: 'pinky', mcp: 17, pip: 18 },
+  ];
+
+  for (const isLeft of [false, true]) {
+    for (const f of allFingers) {
+      // Build hand skeleton with all 5 finger rays
+      const q = new Quaternion();
+      const localJoints = Array.from({ length: 21 }, () => [0, 0, 0]);
+      localJoints[0] = [0, -0.055, 0];
+      localJoints[2] = [-0.045, -0.02, -0.008];
+      localJoints[3] = [-0.055, 0.015, -0.012];
+      localJoints[5] = [-0.035, 0.005, 0];
+      localJoints[6] = [-0.038, 0.048, 0];
+      localJoints[9] = [-0.012, 0.013, 0];
+      localJoints[10] = [-0.013, 0.055, 0];
+      localJoints[13] = [0.01, 0.009, 0];
+      localJoints[14] = [0.012, 0.05, 0];
+      localJoints[17] = [0.032, 0, 0];
+      localJoints[18] = [0.04, 0.034, 0];
+
+      const sign = isLeft ? -1 : 1;
+      const world = localJoints.map(p => new Vector3(p[0] * sign, p[1], p[2]).applyQuaternion(q));
+      const screen = world.map(p => ({ x: 420 + p.x * 2000, y: 650 - p.y * 2000 }));
+      const landmarks = world.map(p => ({
+        x: (420 + p.x * 2000) / 900,
+        y: (650 - p.y * 2000) / 1600,
+        z: -p.z,
+        worldX: p.x,
+        worldY: -p.y,
+        worldZ: -p.z,
+      }));
+
+      const pose = solveRingPose(
+        landmarks,
+        screen,
+        isLeft ? 'Left' : 'Right',
+        false,
+        undefined,
+        f,
+      );
+
+      assert.ok(pose, `Pose should solve for ${f.finger} on ${isLeft ? 'Left' : 'Right'} hand`);
+      assert.ok(pose.fingerLength > 5, `Finger length should be non-zero for ${f.finger}`);
+      assert.ok(pose.handScale > 20, `Hand scale should be valid for ${f.finger}`);
+
+      // Normal Z: dorsal view should have outward facing normal
+      const normalZ = new Vector3(0, 0, 1).applyQuaternion(pose.orientation).z;
+      assert.ok(Math.abs(normalZ) > 0.05, `Surface normal should be defined for ${f.finger}: ${normalZ}`);
+    }
+  }
+});
+
+test('RingSurfaceConstraint resets cleanly when handedness changes to prevent false palm flip', () => {
+  const constraint = new RingSurfaceConstraint();
+  const rightSample = sample({ left: false, yaw: 0 });
+  const leftSample = sample({ left: true, yaw: 0 });
+
+  // 1. Initialize on Right hand
+  const rightPose = constraint.update(
+    rightSample.pose.orientation,
+    rightSample.pose.anchors,
+    rightSample.pose.fingerLength,
+    40,
+    'Right',
+  );
+  assert.ok(rightPose);
+
+  // 2. Switch to Left hand with handedness='Left': should reset reference rather than treating area sign as palm turn
+  const leftPose = constraint.update(
+    leftSample.pose.orientation,
+    leftSample.pose.anchors,
+    leftSample.pose.fingerLength,
+    40,
+    'Left',
+  );
+  assert.ok(leftPose);
+
+  // Dorsal head should remain on dorsal side, not flipped to rear shank
+  const leftNormalZ = new Vector3(0, 0, 1).applyQuaternion(leftPose).z;
+  const rightNormalZ = new Vector3(0, 0, 1).applyQuaternion(rightPose).z;
+  assert.equal(Math.sign(leftNormalZ), Math.sign(rightNormalZ), 'Both dorsal poses should have consistent outward normal sign');
+});
+
 

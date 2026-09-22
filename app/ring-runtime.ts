@@ -1,10 +1,10 @@
 import * as THREE from 'three';
+import type { MetalOption } from './ring-catalog';
 
 // A DPR limit alone still allocates a multi-megapixel framebuffer on an iPad.
 export function ringPixelRatio(width: number, height: number, dpr: number, touch: boolean) {
   const area = Math.max(1, width * height);
-  // Increased pixel ratio limits for sharper rendering
-  return Math.min(dpr || 1, touch ? 2.0 : 2.5, Math.sqrt((touch ? 2_000_000 : 3_500_000) / area));
+  return Math.min(dpr || 1, touch ? 1.5 : 2, Math.sqrt((touch ? 1_200_000 : 2_400_000) / area));
 }
 
 export function limitEnvironmentSize(texture: THREE.Texture, maxWidth: number) {
@@ -59,7 +59,8 @@ export function createFallbackDiamondMaterial() {
   // the device rejects the custom shader, while retaining the original mesh.
   return new THREE.MeshPhysicalMaterial({
     color: '#ececec', metalness: 0, roughness: 0.0,
-    ior: 2.4, envMapIntensity: 1.8, clearcoat: 1,
+    ior: 2.4, envMapIntensity: 2.0, clearcoat: 1,
+    clearcoatRoughness: 0,
     transparent: true, depthWrite: true,
   });
 }
@@ -136,13 +137,54 @@ export async function fetchWithProgressAndCache(
 }
 
 export function updateDiamondEnvironment(
-  materials: THREE.ShaderMaterial[],
+  materials: any[],
   texture: THREE.Texture,
 ) {
   for (const material of materials) {
-    if (material.uniforms?.envMap) {
+    if (material?.uniforms?.uEnvMap) {
+      material.uniforms.uEnvMap.value = texture;
+      material.needsUpdate = true;
+    } else if (material?.uniforms?.envMap) {
       material.uniforms.envMap.value = texture;
+      material.needsUpdate = true;
+    } else if (material && 'envMap' in material) {
+      (material as THREE.MeshPhysicalMaterial).envMap = texture;
       material.needsUpdate = true;
     }
   }
 }
+
+export function createMetalMaterial(preset: MetalOption): THREE.MeshPhysicalMaterial {
+  return new THREE.MeshPhysicalMaterial({
+    color: new THREE.Color(preset.color),
+    metalness: preset.metalness,
+    roughness: preset.roughness,
+    clearcoat: preset.clearcoat,
+    clearcoatRoughness: preset.clearcoatRoughness,
+    envMapIntensity: preset.envMapIntensity,
+    specularIntensity: preset.specularIntensity,
+    specularColor: new THREE.Color(preset.specularColor),
+    side: THREE.FrontSide,
+    depthWrite: true,
+  });
+}
+
+export function applyMetalPreset(
+  material: THREE.MeshPhysicalMaterial,
+  preset: MetalOption,
+): void {
+  material.color.setHex(preset.color);
+  material.metalness = preset.metalness;
+  material.roughness = preset.roughness;
+  material.clearcoat = preset.clearcoat;
+  material.clearcoatRoughness = preset.clearcoatRoughness;
+  material.envMapIntensity = preset.envMapIntensity;
+  if ('specularIntensity' in material) {
+    material.specularIntensity = preset.specularIntensity;
+  }
+  if (material.specularColor) {
+    material.specularColor.setHex(preset.specularColor);
+  }
+  material.needsUpdate = true;
+}
+

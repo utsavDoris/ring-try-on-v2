@@ -238,6 +238,120 @@ export function normalizeRingToUnitHole(
   return factor;
 }
 
+const WEAR_AXIS_INDEX = { x: 0, y: 1, z: 2 } as const;
+
+function collectMetalPoints(root: THREE.Object3D, targetCount = 6000): THREE.Vector3[] {
+  const meshes: THREE.Mesh[] = [];
+  root.updateMatrixWorld(true);
+  root.traverse((object) => {
+    if (object instanceof THREE.Mesh && isMetalMesh(object)) meshes.push(object);
+  });
+
+  let total = 0;
+  for (const mesh of meshes) {
+    total += mesh.geometry.getAttribute('position')?.count ?? 0;
+  }
+  if (total === 0) return [];
+
+  const step = Math.max(1, Math.floor(total / targetCount));
+  const points: THREE.Vector3[] = [];
+  const vertex = new THREE.Vector3();
+  for (const mesh of meshes) {
+    const position = mesh.geometry.getAttribute('position');
+    if (!position) continue;
+    for (let i = 0; i < position.count; i += step) {
+      points.push(
+        vertex.fromBufferAttribute(position, i).applyMatrix4(mesh.matrixWorld).clone(),
+      );
+    }
+  }
+  return points;
+}
+
+/**
+ * How clearly `axis` is the finger hole: high when metal forms a ring
+ * around that axis and almost no metal sits in the opening.
+ */
+function fingerHoleScore(points: readonly THREE.Vector3[], axis: 0 | 1 | 2): number {
+  if (points.length < 48) return 0;
+  const u = ((axis + 1) % 3) as 0 | 1 | 2;
+  const w = ((axis + 2) % 3) as 0 | 1 | 2;
+  const radii = points.map((point) =>
+    Math.hypot(point.getComponent(u), point.getComponent(w)),
+  );
+  radii.sort((a, b) => a - b);
+  const low = radii[Math.floor(radii.length * 0.01)] ?? 0;
+  const high = radii[Math.floor(radii.length * 0.98)] ?? 0;
+  if (high < 1e-4) return 0;
+  let nearZero = 0;
+  const core = high * 0.15;
+  for (const radius of radii) {
+    if (radius < core) nearZero += 1;
+  }
+  if (nearZero / radii.length > 0.02) return 0;
+  return low / high;
+}
+
+function dominantSignedAxis(offset: THREE.Vector3): string {
+  const ax = Math.abs(offset.x);
+  const ay = Math.abs(offset.y);
+  const az = Math.abs(offset.z);
+  if (ax >= ay && ax >= az) return offset.x >= 0 ? '+X' : '-X';
+  if (ay >= ax && ay >= az) return offset.y >= 0 ? '+Y' : '-Y';
+  return offset.z >= 0 ? '+Z' : '-Z';
+}
+
+/**
+ * Authored stone axis that `applyStoneAxisBasis` must bake onto −Z.
+ * LR1844 is already −Z with the hole along Y. The other catalog GLBs
+ * are turned so the hole runs along Z and the head sits on +Y; without
+ * this bake the finger passes through the side of the band.
+ * An eternity band (no head offset) still returns the axis that lays its hole on Y.
+ */
+export function inferWearStoneAxis(root: THREE.Object3D): string {
+  const points = collectMetalPoints(root);
+  if (points.length < 48) return '-Z';
+
+  const bounds = new THREE.Box3();
+  for (const point of points) bounds.expandByPoint(point);
+  const origin = bounds.getCenter(new THREE.Vector3());
+  for (const point of points) point.sub(origin);
+
+  let fingerAxis: 0 | 1 | 2 = 1;
+  let bestScore = -1;
+  for (const axis of [0, 1, 2] as const) {
+    const score = fingerHoleScore(points, axis);
+    if (score > bestScore) {
+      bestScore = score;
+      fingerAxis = axis;
+    }
+  }
+
+  const gemCenter = new THREE.Vector3();
+  let gemWeight = 0;
+  root.traverse((object) => {
+    if (!(object instanceof THREE.Mesh) || !isGemMesh(object)) return;
+    const box = new THREE.Box3().setFromObject(object);
+    if (box.isEmpty()) return;
+    const size = box.getSize(new THREE.Vector3());
+    const weight = Math.max(Math.abs(size.x * size.y * size.z), 1e-9);
+    gemCenter.addScaledVector(box.getCenter(new THREE.Vector3()), weight);
+    gemWeight += weight;
+  });
+
+  if (gemWeight > 0) gemCenter.multiplyScalar(1 / gemWeight).sub(origin);
+  gemCenter.setComponent(fingerAxis, 0);
+
+  const extent = bounds.getSize(new THREE.Vector3());
+  const outer = Math.max(extent.x, extent.y, extent.z, 1e-4);
+  if (gemCenter.length() < outer * 0.12) {
+    if (fingerAxis === WEAR_AXIS_INDEX.z) return '+Y';
+    if (fingerAxis === WEAR_AXIS_INDEX.x) return '-Z';
+    return '-Z';
+  }
+  return dominantSignedAxis(gemCenter);
+}
+
 /**
  * Bake authored stone/head axis onto model −Z so runtime pose + Flip share one head direction.
  * Supported: -Z (default/no-op), +Z, ±Y, ±X.
@@ -267,6 +381,43 @@ export function applyStoneAxisBasis(
   model.userData.stoneAxis = '-Z';
   model.userData.stoneAxisSource = axis;
   return q;
+}
+
+/**
+ * Inner diameter used to normalize a GLB.
+ * Authored glTF extras win (LR1844). Otherwise a real metal-band measurement
+ * wins over a catalog hint, because hints for sideways models were only the
+ * outer-width fallback and size the hole wrong.
+ */
+export function resolveRawInnerDiameter(
+  root: THREE.Object3D,
+  options: { authored?: number; hint?: number; fallbackRatio?: number } = {},
+): number {
+  const ratio = options.fallbackRatio ?? DEFAULT_INNER_TO_OUTER_DIAMETER;
+  if (
+    typeof options.authored === 'number' &&
+    Number.isFinite(options.authored) &&
+    options.authored > 0
+  ) {
+    return options.authored;
+  }
+
+  const measured = measureRingInnerDiameter(root, ratio);
+  root.updateMatrixWorld(true);
+  const outer = Math.max(
+    new THREE.Box3().setFromObject(root).getSize(new THREE.Vector3()).x,
+    0.001,
+  );
+  const fallback = outer * ratio;
+  if (Math.abs(measured - fallback) > 1e-3) return measured;
+  if (
+    typeof options.hint === 'number' &&
+    Number.isFinite(options.hint) &&
+    options.hint > 0
+  ) {
+    return options.hint;
+  }
+  return measured;
 }
 
 /** World scale for a unit-hole ring given exact finger diameter in world units. */

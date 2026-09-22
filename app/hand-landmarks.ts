@@ -27,7 +27,7 @@ export const LANDMARKS = {
   PINKY_TIP: 20,
 } as const;
 
-export type TryOnFinger = 'index' | 'middle' | 'ring';
+export type TryOnFinger = 'thumb' | 'index' | 'middle' | 'ring' | 'pinky';
 
 export type FingerDef = {
   name: TryOnFinger;
@@ -36,10 +36,22 @@ export type FingerDef = {
   pip: number;
   dip: number;
   tip: number;
+  widthRatio: number;
+  defaultSeat: number;
 };
 
-/** UI try-on fingers (thumb/pinky omitted — same as v1 pills). */
+/** UI try-on fingers */
 export const TRY_ON_FINGERS: FingerDef[] = [
+  {
+    name: 'thumb',
+    label: 'Thumb',
+    mcp: LANDMARKS.THUMB_MCP,
+    pip: LANDMARKS.THUMB_IP,
+    dip: LANDMARKS.THUMB_IP, // Thumb only has IP, so we duplicate it for DIP if needed
+    tip: LANDMARKS.THUMB_TIP,
+    widthRatio: 1.18,
+    defaultSeat: 0.46,
+  },
   {
     name: 'index',
     label: 'Index',
@@ -47,6 +59,8 @@ export const TRY_ON_FINGERS: FingerDef[] = [
     pip: LANDMARKS.INDEX_PIP,
     dip: LANDMARKS.INDEX_DIP,
     tip: LANDMARKS.INDEX_TIP,
+    widthRatio: 1.02,
+    defaultSeat: 0.42,
   },
   {
     name: 'middle',
@@ -55,6 +69,8 @@ export const TRY_ON_FINGERS: FingerDef[] = [
     pip: LANDMARKS.MIDDLE_PIP,
     dip: LANDMARKS.MIDDLE_DIP,
     tip: LANDMARKS.MIDDLE_TIP,
+    widthRatio: 1.07,
+    defaultSeat: 0.42,
   },
   {
     name: 'ring',
@@ -63,13 +79,25 @@ export const TRY_ON_FINGERS: FingerDef[] = [
     pip: LANDMARKS.RING_PIP,
     dip: LANDMARKS.RING_DIP,
     tip: LANDMARKS.RING_TIP,
+    widthRatio: 1.0,
+    defaultSeat: 0.60,
+  },
+  {
+    name: 'pinky',
+    label: 'Pinky',
+    mcp: LANDMARKS.PINKY_MCP,
+    pip: LANDMARKS.PINKY_PIP,
+    dip: LANDMARKS.PINKY_DIP,
+    tip: LANDMARKS.PINKY_TIP,
+    widthRatio: 0.8,
+    defaultSeat: 0.38,
   },
 ];
 
 export const DEFAULT_TRY_ON_FINGER: TryOnFinger = 'ring';
 
 export function getFingerDef(name: TryOnFinger): FingerDef {
-  return TRY_ON_FINGERS.find((f) => f.name === name) ?? TRY_ON_FINGERS[2];
+  return TRY_ON_FINGERS.find((f) => f.name === name) ?? TRY_ON_FINGERS[3];
 }
 
 /** Neighbor bones for silhouette clipping (same pairing as v1 fingerMetrics). */
@@ -77,6 +105,8 @@ export function neighborsForFinger(
   name: TryOnFinger,
 ): { mcp: number; pip: number }[] {
   switch (name) {
+    case 'thumb':
+      return [{ mcp: LANDMARKS.INDEX_MCP, pip: LANDMARKS.INDEX_PIP }];
     case 'index':
       return [{ mcp: LANDMARKS.MIDDLE_MCP, pip: LANDMARKS.MIDDLE_PIP }];
     case 'middle':
@@ -85,10 +115,12 @@ export function neighborsForFinger(
         { mcp: LANDMARKS.RING_MCP, pip: LANDMARKS.RING_PIP },
       ];
     case 'ring':
-    default:
       return [
         { mcp: LANDMARKS.MIDDLE_MCP, pip: LANDMARKS.MIDDLE_PIP },
         { mcp: LANDMARKS.PINKY_MCP, pip: LANDMARKS.PINKY_PIP },
       ];
+    case 'pinky':
+    default:
+      return [{ mcp: LANDMARKS.RING_MCP, pip: LANDMARKS.RING_PIP }];
   }
 }

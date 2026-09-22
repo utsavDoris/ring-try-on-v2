@@ -145,7 +145,13 @@ export default defineConfig(async () => {
       host: '0.0.0.0',
       https: localHttps,
       watch: {
-        ignored: ['**/public/mediapipe/**', '**/public/opencv/**'],
+        ignored: [
+          '**/public/mediapipe/**',
+          '**/public/opencv/**',
+          '**/dist/**',
+          '**/.vinext/**',
+          '**/.next/**',
+        ],
         ...(isCodexSeatbeltSandbox
           ? { useFsEvents: false, usePolling: true }
           : {}),
